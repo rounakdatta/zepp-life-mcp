@@ -1,11 +1,14 @@
 """Export file adapter for reading Zepp Life exported data."""
 
 import csv
+import hashlib
 import json
+import logging
 import uuid
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from zepp_life_mcp.adapters.base import DataAdapter
 from zepp_life_mcp.models import (
@@ -15,6 +18,8 @@ from zepp_life_mcp.models import (
     SleepSession,
     Workout,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ExportFileAdapter(DataAdapter):
@@ -30,6 +35,10 @@ class ExportFileAdapter(DataAdapter):
         self._connected = False
         self._user_id: str | None = None
         self._available_types: list[str] = []
+
+    def _stable_id(self, record_type: str, *parts: object) -> str:
+        identity = ":".join(str(part) for part in (self._user_id or "unknown", *parts))
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"zepp-life:{record_type}:{identity}"))
 
     def connect(self) -> bool:
         """Validate export directory structure."""
@@ -145,8 +154,9 @@ class ExportFileAdapter(DataAdapter):
             except (OSError, json.JSONDecodeError, KeyError):
                 continue
 
-        # Generate a synthetic user ID based on export path
-        return f"export_{self.export_path.stat().st_mtime_ns}"
+        canonical_path = str(self.export_path.resolve())
+        path_hash = hashlib.sha256(canonical_path.encode()).hexdigest()
+        return f"export_{path_hash}"
 
     def iter_daily_activity(
         self,
@@ -160,7 +170,7 @@ class ExportFileAdapter(DataAdapter):
             try:
                 yield from self._parse_activity_file(file_path, start_date, end_date)
             except Exception as e:
-                print(f"Warning: Failed to parse {file_path}: {e}")
+                logger.warning("Failed to parse %s: %s", file_path, e)
                 continue
 
     def _parse_activity_file(
@@ -268,17 +278,23 @@ class ExportFileAdapter(DataAdapter):
                     continue
 
         return DailyActivity(
-            id=str(uuid.uuid4()),
+            id=self._stable_id("activity", date),
             provider="zepp_life",
             source_type="export_file",
+            source_record_id=None,
             user_id=self._user_id or "unknown",
+            device_id=None,
+            collected_at=None,
             date=date,
             steps=steps,
             distance_m=distance_m,
             active_kcal=active_kcal,
+            total_kcal=None,
+            floors=None,
+            active_minutes=None,
         )
 
-    def _dict_to_activity(self, data: dict) -> DailyActivity | None:
+    def _dict_to_activity(self, data: dict[str, Any]) -> DailyActivity | None:
         """Convert dict to DailyActivity."""
         # Handle various field naming conventions
         date = None
@@ -321,14 +337,20 @@ class ExportFileAdapter(DataAdapter):
                     continue
 
         return DailyActivity(
-            id=str(uuid.uuid4()),
+            id=self._stable_id("activity", date),
             provider="zepp_life",
             source_type="export_file",
+            source_record_id=None,
             user_id=self._user_id or "unknown",
+            device_id=None,
+            collected_at=None,
             date=date,
             steps=steps,
             distance_m=distance_m,
             active_kcal=active_kcal,
+            total_kcal=None,
+            floors=None,
+            active_minutes=None,
         )
 
     def iter_sleep_sessions(
@@ -343,7 +365,7 @@ class ExportFileAdapter(DataAdapter):
             try:
                 yield from self._parse_sleep_file(file_path, start_date, end_date)
             except Exception as e:
-                print(f"Warning: Failed to parse {file_path}: {e}")
+                logger.warning("Failed to parse %s: %s", file_path, e)
                 continue
 
     def _parse_sleep_file(
@@ -406,7 +428,7 @@ class ExportFileAdapter(DataAdapter):
         # Real implementation would need to parse various export formats
         return None
 
-    def _dict_to_sleep(self, data: dict) -> SleepSession | None:
+    def _dict_to_sleep(self, data: dict[str, Any]) -> SleepSession | None:
         """Convert dict to SleepSession."""
         try:
             # Try to extract start/end times
@@ -438,12 +460,17 @@ class ExportFileAdapter(DataAdapter):
                     except (ValueError, TypeError):
                         continue
 
+            sleep_id = self._stable_id("sleep", start.isoformat(), end.isoformat())
             return SleepSession(
-                id=str(uuid.uuid4()),
+                id=sleep_id,
                 provider="zepp_life",
                 source_type="export_file",
+                source_record_id=None,
                 user_id=self._user_id or "unknown",
-                sleep_id=str(uuid.uuid4()),
+                device_id=None,
+                collected_at=None,
+                sleep_id=sleep_id,
+                local_date=start.date().isoformat(),
                 start_at=start,
                 end_at=end,
                 duration_minutes=duration,
@@ -466,7 +493,7 @@ class ExportFileAdapter(DataAdapter):
             try:
                 yield from self._parse_workout_file(file_path, start_date, end_date)
             except Exception as e:
-                print(f"Warning: Failed to parse {file_path}: {e}")
+                logger.warning("Failed to parse %s: %s", file_path, e)
                 continue
 
     def _parse_workout_file(
@@ -526,7 +553,7 @@ class ExportFileAdapter(DataAdapter):
         """Convert CSV row to Workout."""
         return None  # Simplified
 
-    def _dict_to_workout(self, data: dict) -> Workout | None:
+    def _dict_to_workout(self, data: dict[str, Any]) -> Workout | None:
         """Convert dict to Workout."""
         try:
             # Extract activity type
@@ -589,18 +616,28 @@ class ExportFileAdapter(DataAdapter):
                     except (ValueError, TypeError):
                         continue
 
+            workout_id = self._stable_id("workout", start.isoformat(), activity_type)
             return Workout(
-                id=str(uuid.uuid4()),
+                id=workout_id,
                 provider="zepp_life",
                 source_type="export_file",
+                source_record_id=None,
                 user_id=self._user_id or "unknown",
-                workout_id=str(uuid.uuid4()),
+                device_id=None,
+                collected_at=None,
+                workout_id=workout_id,
+                local_date=start.date().isoformat(),
                 activity_type=activity_type,
                 start_at=start,
                 end_at=end or start,
                 duration_minutes=duration,
                 distance_m=distance_m,
                 calories_kcal=calories,
+                avg_heart_rate_bpm=None,
+                max_heart_rate_bpm=None,
+                avg_pace_sec_per_km=None,
+                max_pace_sec_per_km=None,
+                total_steps=None,
             )
         except Exception:
             return None
@@ -617,7 +654,7 @@ class ExportFileAdapter(DataAdapter):
             try:
                 yield from self._parse_body_file(file_path, start_date, end_date)
             except Exception as e:
-                print(f"Warning: Failed to parse {file_path}: {e}")
+                logger.warning("Failed to parse %s: %s", file_path, e)
                 continue
 
     def _parse_body_file(
@@ -677,7 +714,7 @@ class ExportFileAdapter(DataAdapter):
         """Convert CSV row to BodyMeasurement."""
         return None  # Simplified
 
-    def _dict_to_body_measurement(self, data: dict) -> BodyMeasurement | None:
+    def _dict_to_body_measurement(self, data: dict[str, Any]) -> BodyMeasurement | None:
         """Convert dict to BodyMeasurement."""
         try:
             # Extract timestamp
@@ -741,16 +778,24 @@ class ExportFileAdapter(DataAdapter):
                         continue
 
             return BodyMeasurement(
-                id=str(uuid.uuid4()),
+                id=self._stable_id("body", timestamp.isoformat()),
                 provider="zepp_life",
                 source_type="export_file",
+                source_record_id=None,
                 user_id=self._user_id or "unknown",
+                device_id=None,
+                collected_at=None,
                 timestamp=timestamp,
+                local_date=timestamp.date().isoformat(),
                 weight_kg=weight,
                 bmi=bmi,
                 body_fat_pct=body_fat,
                 muscle_mass_kg=muscle_mass,
                 water_pct=water,
+                bone_mass_kg=None,
+                visceral_fat_score=None,
+                basal_metabolism_kcal=None,
+                metabolic_age=None,
             )
         except Exception:
             return None
@@ -803,14 +848,15 @@ class ExportFileAdapter(DataAdapter):
 
         for fmt in formats:
             try:
-                return datetime.strptime(dt_str.strip(), fmt)
+                parsed = datetime.strptime(dt_str.strip(), fmt)
+                return parsed.replace(tzinfo=UTC) if fmt.endswith("Z") else parsed
             except ValueError:
                 continue
 
         # Try Unix timestamp
         try:
             timestamp = float(dt_str)
-            return datetime.fromtimestamp(timestamp)
+            return datetime.fromtimestamp(timestamp, UTC)
         except ValueError:
             pass
 

@@ -47,9 +47,10 @@ def cmd_setup(args):
         config = Config(mode="cloud_session", region=args.region or "eu")
         save_config(config)
         print("✅ Конфигурация сохранена (cloud_session)")
-        print(f"   Токен: {args.token[:20]}...")
+        print(f"   Токен: {args.token[:4]}***")
         if args.user_id:
-            print(f"   User ID: {args.user_id}")
+            suffix = args.user_id[-4:]
+            print(f"   User ID: {'*' * max(0, len(args.user_id) - 4)}{suffix}")
         return
 
     print(f"{PROGRAM_NAME} - Setup Wizard")
@@ -117,7 +118,7 @@ def cmd_doctor(args):
         elif config.mode == "cloud_session":
             token, user_id = load_token()
             if token:
-                print(f"✅ Токен найден: {token[:20]}...")
+                print(f"✅ Токен найден: {token[:4]}***")
                 adapter = CloudSessionAdapter(token, user_id, region=config.region)
                 connected, data_types = asyncio.run(_check_adapter_health(adapter))
                 print(f"   Подключение: {'✅' if connected else '❌'}")
@@ -171,7 +172,7 @@ async def cmd_sync_async(args):
             print("❌ Токен не найден")
             print(f"   Запустите: {PROGRAM_NAME} setup")
             sys.exit(1)
-        adapter = CloudSessionAdapter(token, user_id)
+        adapter = CloudSessionAdapter(token, user_id, config.region, config.timezone)
         if not await adapter.connect():
             print("❌ Не удалось подключиться к API")
             sys.exit(1)

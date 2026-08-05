@@ -17,8 +17,8 @@ class BaseEntity(BaseModel):
     device_id: str | None = Field(None, description="Device that recorded the data")
     timezone: str = Field(default="UTC", description="Timezone for the data")
     collected_at: datetime | None = Field(None, description="When data was recorded")
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC).replace(tzinfo=None))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC).replace(tzinfo=None))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class DailyActivity(BaseEntity):
@@ -44,11 +44,14 @@ class SleepSession(BaseEntity):
     """Sleep session data."""
 
     sleep_id: str = Field(description="Unique sleep session ID")
+    local_date: str | None = Field(None, description="Local calendar date at sleep start")
     start_at: datetime = Field(description="Sleep start time")
     end_at: datetime = Field(description="Sleep end time")
     duration_minutes: int = Field(ge=0, description="Total duration")
     time_asleep_minutes: int = Field(ge=0, description="Actual sleep time")
     time_awake_minutes: int = Field(ge=0, description="Time awake during sleep")
+    rem_minutes: int = Field(default=0, ge=0, description="Time in REM sleep")
+    wake_count: int = Field(default=0, ge=0, description="Number of awake stages")
     sleep_score: int | None = Field(None, ge=0, le=100, description="Sleep quality score")
     is_nap: bool = Field(default=False, description="Whether this is a nap")
     stages: list[SleepStage] = Field(default_factory=list, description="Sleep stages breakdown")
@@ -58,6 +61,7 @@ class Workout(BaseEntity):
     """Workout/exercise session."""
 
     workout_id: str = Field(description="Unique workout ID")
+    local_date: str | None = Field(None, description="Local calendar date at workout start")
     activity_type: str = Field(description="Type of activity (running, cycling, etc.)")
     start_at: datetime = Field(description="Workout start time")
     end_at: datetime = Field(description="Workout end time")
@@ -75,6 +79,7 @@ class BodyMeasurement(BaseEntity):
     """Body composition measurement (from smart scale)."""
 
     timestamp: datetime = Field(description="Measurement time")
+    local_date: str | None = Field(None, description="Local calendar date of measurement")
     weight_kg: float = Field(gt=0, description="Weight in kilograms")
     bmi: float | None = Field(None, gt=0, description="Body mass index")
     body_fat_pct: float | None = Field(None, ge=0, le=100, description="Body fat percentage")
@@ -90,6 +95,7 @@ class HeartRateSample(BaseEntity):
     """Heart rate measurement."""
 
     timestamp: datetime = Field(description="Measurement time")
+    local_date: str | None = Field(None, description="Local calendar date of sample")
     bpm: int = Field(ge=0, description="Heart rate in beats per minute")
     sample_type: Literal["resting", "active", "passive", "workout"] = Field(
         default="passive", description="Type of measurement"
@@ -175,7 +181,7 @@ class QueryResponse(BaseModel):
 
     status: Literal["ok", "error"] = "ok"
     source: Literal["export_file", "cloud_session", "cache", "unknown"]
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC).replace(tzinfo=None))
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     timezone: str = "UTC"
     data: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None

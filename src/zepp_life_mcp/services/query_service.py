@@ -1,7 +1,7 @@
 """Query service for retrieving data from database."""
 
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from zepp_life_mcp.storage import Database
@@ -20,8 +20,19 @@ class QueryService:
         self.db = db
         self.user_id = user_id
 
+    @staticmethod
+    def _validate_date_range(start_date: str, end_date: str) -> None:
+        try:
+            start = date.fromisoformat(start_date)
+            end = date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise ValueError("start_date and end_date must use YYYY-MM-DD format") from exc
+        if start > end:
+            raise ValueError("start_date must be on or before end_date")
+
     def get_daily_summaries(self, start_date: str, end_date: str) -> list[dict[str, Any]]:
         """Get daily activity summaries for date range."""
+        self._validate_date_range(start_date, end_date)
         records = self.db.query_daily_activity(self.user_id, start_date, end_date)
 
         # Group by date and aggregate
@@ -60,47 +71,57 @@ class QueryService:
         aggregation: str = "sum",
     ) -> list[dict[str, Any]]:
         """Get time series for a metric."""
-        summaries = self.get_daily_summaries(start_date, end_date)
+        self._validate_date_range(start_date, end_date)
+        valid_metrics = {"steps", "distance_m", "active_kcal", "weight_kg", "sleep_minutes"}
+        valid_granularities = {"day", "week", "month"}
+        valid_aggregations = {"sum", "avg", "min", "max", "latest"}
+        if metric not in valid_metrics:
+            raise ValueError(f"Unknown metric: {metric}")
+        if granularity not in valid_granularities:
+            raise ValueError(f"Unknown granularity: {granularity}")
+        if aggregation not in valid_aggregations:
+            raise ValueError(f"Unknown aggregation: {aggregation}")
 
-        series = []
-        for summary in summaries:
-            value = summary.get(metric)
-            if value is not None:
-                series.append(
-                    {
-                        "date": summary["date"],
-                        "value": value,
-                    }
-                )
+        if metric == "weight_kg":
+            records = self.db.query_body_measurements(self.user_id, start_date, end_date)
+            series = [
+                {"date": record["local_date"], "value": record["weight_kg"]}
+                for record in records
+            ]
+        elif metric == "sleep_minutes":
+            records = self.db.query_sleep_sessions(self.user_id, start_date, end_date)
+            series = [
+                {"date": record["local_date"], "value": record["time_asleep_minutes"]}
+                for record in records
+            ]
+        else:
+            summaries = self.get_daily_summaries(start_date, end_date)
+            series = [
+                {"date": summary["date"], "value": summary[metric]}
+                for summary in summaries
+            ]
 
-        # Apply aggregation if needed
-        if granularity == "week":
-            series = self._aggregate_by_week(series, aggregation)
-        elif granularity == "month":
-            series = self._aggregate_by_month(series, aggregation)
+        return self._aggregate_series(series, granularity, aggregation)
 
-        return series
-
-    def _aggregate_by_week(
-        self,
-        series: list[dict],
+    @staticmethod
+    def _aggregate_series(
+        series: list[dict[str, Any]],
+        granularity: str,
         aggregation: str,
-    ) -> list[dict]:
-        """Aggregate daily series by week."""
-        weeks = {}
-
+    ) -> list[dict[str, Any]]:
+        groups: dict[str, list[float]] = {}
         for item in series:
-            date = datetime.strptime(item["date"], "%Y-%m-%d")
-            # Get week start (Monday)
-            week_start = date - timedelta(days=date.weekday())
-            week_key = week_start.strftime("%Y-%m-%d")
-
-            if week_key not in weeks:
-                weeks[week_key] = []
-            weeks[week_key].append(item["value"])
+            item_date = date.fromisoformat(item["date"])
+            if granularity == "week":
+                period_date = item_date - timedelta(days=item_date.weekday())
+            elif granularity == "month":
+                period_date = item_date.replace(day=1)
+            else:
+                period_date = item_date
+            groups.setdefault(period_date.isoformat(), []).append(item["value"])
 
         result = []
-        for week_key, values in sorted(weeks.items()):
+        for period, values in sorted(groups.items()):
             if aggregation == "sum":
                 value = sum(values)
             elif aggregation == "avg":
@@ -110,43 +131,8 @@ class QueryService:
             elif aggregation == "max":
                 value = max(values)
             else:
-                value = sum(values)
-
-            result.append({"date": week_key, "value": value})
-
-        return result
-
-    def _aggregate_by_month(
-        self,
-        series: list[dict],
-        aggregation: str,
-    ) -> list[dict]:
-        """Aggregate daily series by month."""
-        months = {}
-
-        for item in series:
-            date = datetime.strptime(item["date"], "%Y-%m-%d")
-            month_key = date.strftime("%Y-%m")
-
-            if month_key not in months:
-                months[month_key] = []
-            months[month_key].append(item["value"])
-
-        result = []
-        for month_key, values in sorted(months.items()):
-            if aggregation == "sum":
-                value = sum(values)
-            elif aggregation == "avg":
-                value = sum(values) / len(values)
-            elif aggregation == "min":
-                value = min(values)
-            elif aggregation == "max":
-                value = max(values)
-            else:
-                value = sum(values)
-
-            result.append({"date": month_key + "-01", "value": value})
-
+                value = values[-1]
+            result.append({"date": period, "value": value})
         return result
 
     def get_sleep_sessions(
@@ -156,6 +142,7 @@ class QueryService:
         include_naps: bool = True,
     ) -> list[dict[str, Any]]:
         """Get sleep sessions for date range."""
+        self._validate_date_range(start_date, end_date)
         records = self.db.query_sleep_sessions(self.user_id, start_date, end_date)
 
         sessions = []
@@ -171,6 +158,8 @@ class QueryService:
                 "duration_minutes": record["duration_minutes"],
                 "time_asleep_minutes": record["time_asleep_minutes"],
                 "time_awake_minutes": record["time_awake_minutes"],
+                "rem_minutes": record.get("rem_minutes", 0),
+                "wake_count": record.get("wake_count", 0),
                 "sleep_score": record.get("sleep_score"),
                 "is_nap": record.get("is_nap", False),
             }
@@ -195,6 +184,7 @@ class QueryService:
         min_distance_km: float | None = None,
     ) -> list[dict[str, Any]]:
         """Get workouts for date range with optional filters."""
+        self._validate_date_range(start_date, end_date)
         records = self.db.query_workouts(self.user_id, start_date, end_date)
 
         workouts = []
@@ -239,6 +229,7 @@ class QueryService:
         metrics: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Get body measurements for date range."""
+        self._validate_date_range(start_date, end_date)
         records = self.db.query_body_measurements(self.user_id, start_date, end_date)
 
         measurements = []
@@ -283,6 +274,7 @@ class QueryService:
         sample_type: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        self._validate_date_range(start_date, end_date)
         records = self.db.query_heart_rate_samples(self.user_id, start_date, end_date)
 
         samples = []

@@ -3,11 +3,11 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from zepp_life_mcp.adapters.base import DataAdapter
-from zepp_life_mcp.storage import Database
+from zepp_life_mcp.storage import Database, UpsertOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class SyncService:
         start_date: str | None = None,
         end_date: str | None = None,
         force_full: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Synchronize a specific data type.
 
         Args:
@@ -55,86 +55,97 @@ class SyncService:
         if not self.adapter.is_connected():
             raise RuntimeError("Adapter not connected")
 
-        # Get last sync state for incremental sync
-        last_record_ts = None
+        source_type = getattr(self.adapter, "source_type", None)
+        if not source_type:
+            adapter_name = self.adapter.__class__.__name__.removesuffix("Adapter")
+            source_type = {
+                "CloudSession": "cloud_session",
+                "ExportFile": "export_file",
+            }.get(adapter_name, adapter_name.lower())
+        user_id = self.adapter.get_user_id() or "unknown"
+
+        cursor_date = None
         if not force_full:
-            state = self.db.get_sync_state(data_type)
-            if state and state.get("last_record_timestamp"):
-                last_record_ts = datetime.fromisoformat(state["last_record_timestamp"])
+            state = self.db.get_sync_state(source_type, user_id, data_type)
+            if state:
+                cursor_date = state.get("cursor_date")
 
         if not end_date:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date = date.today().isoformat()
         if not start_date:
-            if last_record_ts:
-                start_date = last_record_ts.strftime("%Y-%m-%d")
+            if cursor_date:
+                start_date = cursor_date
             elif self.adapter.__class__.__name__ == "CloudSessionAdapter":
                 start_date = "2020-01-01"
             else:
                 start = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=30)
                 start_date = start.strftime("%Y-%m-%d")
 
+        assert start_date is not None
+        assert end_date is not None
+        try:
+            parsed_start = date.fromisoformat(start_date)
+            parsed_end = date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise ValueError("start_date and end_date must use YYYY-MM-DD format") from exc
+        if parsed_start > parsed_end:
+            raise ValueError("start_date must be on or before end_date")
+
         added = 0
         updated = 0
         skipped = 0
-        last_ts = None
 
-        # Sync based on data type
-        if data_type == "daily_activity":
-            records = self.adapter.iter_daily_activity(start_date, end_date)
-            async for activity in self._iterate_records(records):
-                if self.db.insert_daily_activity(activity):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or (activity.collected_at and activity.collected_at > last_ts):
-                    last_ts = activity.collected_at
+        def count_outcome(outcome: UpsertOutcome) -> None:
+            nonlocal added, updated, skipped
+            if outcome == UpsertOutcome.INSERTED:
+                added += 1
+            elif outcome == UpsertOutcome.UPDATED:
+                updated += 1
+            else:
+                skipped += 1
 
-        elif data_type == "sleep":
-            records = self.adapter.iter_sleep_sessions(start_date, end_date)
-            async for sleep in self._iterate_records(records):
-                if self.db.insert_sleep_session(sleep):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or sleep.start_at > last_ts:
-                    last_ts = sleep.start_at
+        try:
+            if data_type == "daily_activity":
+                records = self.adapter.iter_daily_activity(start_date, end_date)
+                async for activity in self._iterate_records(records):
+                    count_outcome(self.db.upsert_daily_activity(activity))
+            elif data_type == "sleep":
+                records = self.adapter.iter_sleep_sessions(start_date, end_date)
+                async for sleep in self._iterate_records(records):
+                    count_outcome(self.db.upsert_sleep_session(sleep))
+            elif data_type == "workouts":
+                records = self.adapter.iter_workouts(start_date, end_date)
+                async for workout in self._iterate_records(records):
+                    count_outcome(self.db.upsert_workout(workout))
+            elif data_type == "body_measurements":
+                records = self.adapter.iter_body_measurements(start_date, end_date)
+                async for measurement in self._iterate_records(records):
+                    count_outcome(self.db.upsert_body_measurement(measurement))
+            elif data_type == "heart_rate":
+                records = self.adapter.iter_heart_rate(start_date, end_date)
+                async for sample in self._iterate_records(records):
+                    count_outcome(self.db.upsert_heart_rate_sample(sample))
+            else:
+                raise ValueError(f"Unknown data type: {data_type}")
+        except Exception as exc:
+            self.db.update_sync_state(
+                source_type,
+                user_id,
+                data_type,
+                records_count=added + updated + skipped,
+                success=False,
+                error=str(exc),
+            )
+            raise
 
-        elif data_type == "workouts":
-            records = self.adapter.iter_workouts(start_date, end_date)
-            async for workout in self._iterate_records(records):
-                if self.db.insert_workout(workout):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or workout.start_at > last_ts:
-                    last_ts = workout.start_at
-
-        elif data_type == "body_measurements":
-            records = self.adapter.iter_body_measurements(start_date, end_date)
-            async for measurement in self._iterate_records(records):
-                if self.db.insert_body_measurement(measurement):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or measurement.timestamp > last_ts:
-                    last_ts = measurement.timestamp
-
-        elif data_type == "heart_rate":
-            records = self.adapter.iter_heart_rate(start_date, end_date)
-            async for sample in self._iterate_records(records):
-                if self.db.insert_heart_rate_sample(sample):
-                    added += 1
-                else:
-                    updated += 1
-                if last_ts is None or sample.timestamp > last_ts:
-                    last_ts = sample.timestamp
-
-        else:
-            raise ValueError(f"Unknown data type: {data_type}")
-
-        # Update sync state
-        if last_ts:
-            self.db.update_sync_state(data_type, last_ts)
+        self.db.update_sync_state(
+            source_type,
+            user_id,
+            data_type,
+            cursor_date=end_date,
+            records_count=added + updated + skipped,
+            success=True,
+        )
 
         logger.info(
             f"Synced {data_type}: {added} added, {updated} updated, "
@@ -156,7 +167,7 @@ class SyncService:
         start_date: str | None = None,
         end_date: str | None = None,
         force_full: bool = False,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Synchronous wrapper for sync_data_type.
 
         Use this when calling from synchronous code.

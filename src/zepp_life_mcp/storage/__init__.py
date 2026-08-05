@@ -3,7 +3,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,13 @@ from zepp_life_mcp.models import (
     SleepSession,
     Workout,
 )
+from zepp_life_mcp.storage.migrations import run_migrations
+
+
+class UpsertOutcome(StrEnum):
+    INSERTED = "inserted"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
 
 
 class Database:
@@ -31,167 +38,7 @@ class Database:
     def _init_db(self) -> None:
         """Initialize database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with self._get_connection() as conn:
-            # Daily activity table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS daily_activity (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    date TEXT NOT NULL,
-                    steps INTEGER NOT NULL DEFAULT 0,
-                    distance_m REAL NOT NULL DEFAULT 0,
-                    active_kcal REAL NOT NULL DEFAULT 0,
-                    total_kcal REAL,
-                    floors INTEGER,
-                    active_minutes INTEGER,
-                    UNIQUE(user_id, date, device_id)
-                )
-            """)
-
-            # Sleep sessions table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sleep_sessions (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    sleep_id TEXT NOT NULL,
-                    start_at TIMESTAMP NOT NULL,
-                    end_at TIMESTAMP NOT NULL,
-                    duration_minutes INTEGER NOT NULL,
-                    time_asleep_minutes INTEGER NOT NULL,
-                    time_awake_minutes INTEGER NOT NULL,
-                    sleep_score INTEGER,
-                    is_nap BOOLEAN DEFAULT FALSE,
-                    stages TEXT,  -- JSON array of sleep stages
-                    UNIQUE(user_id, sleep_id)
-                )
-            """)
-
-            # Workouts table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS workouts (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    workout_id TEXT NOT NULL,
-                    activity_type TEXT NOT NULL,
-                    start_at TIMESTAMP NOT NULL,
-                    end_at TIMESTAMP NOT NULL,
-                    duration_minutes INTEGER NOT NULL,
-                    distance_m REAL,
-                    calories_kcal REAL,
-                    avg_heart_rate_bpm INTEGER,
-                    max_heart_rate_bpm INTEGER,
-                    avg_pace_sec_per_km REAL,
-                    max_pace_sec_per_km REAL,
-                    total_steps INTEGER,
-                    UNIQUE(user_id, workout_id)
-                )
-            """)
-
-            # Body measurements table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS body_measurements (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    timestamp TIMESTAMP NOT NULL,
-                    weight_kg REAL NOT NULL,
-                    bmi REAL,
-                    body_fat_pct REAL,
-                    muscle_mass_kg REAL,
-                    water_pct REAL,
-                    bone_mass_kg REAL,
-                    visceral_fat_score INTEGER,
-                    basal_metabolism_kcal INTEGER,
-                    metabolic_age INTEGER,
-                    UNIQUE(user_id, timestamp, device_id)
-                )
-            """)
-
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS heart_rate_samples (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    source_type TEXT NOT NULL,
-                    source_record_id TEXT,
-                    user_id TEXT NOT NULL,
-                    device_id TEXT,
-                    timezone TEXT DEFAULT 'UTC',
-                    collected_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    timestamp TIMESTAMP NOT NULL,
-                    bpm INTEGER NOT NULL,
-                    sample_type TEXT NOT NULL,
-                    UNIQUE(user_id, timestamp, sample_type)
-                )
-            """)
-
-            # Sync state table
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS sync_state (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    data_type TEXT NOT NULL UNIQUE,
-                    last_sync_at TIMESTAMP,
-                    last_record_timestamp TIMESTAMP,
-                    records_count INTEGER DEFAULT 0
-                )
-            """)
-
-            # Create indexes for better query performance
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_activity_user_date
-                ON daily_activity(user_id, date)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sleep_user_start
-                ON sleep_sessions(user_id, start_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_workouts_user_start
-                ON workouts(user_id, start_at)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_measurements_user_ts
-                ON body_measurements(user_id, timestamp)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_heart_rate_user_ts
-                ON heart_rate_samples(user_id, timestamp)
-            """)
-
-            conn.commit()
+        run_migrations(self.db_path)
 
     @contextmanager
     def _get_connection(self):
@@ -203,230 +50,294 @@ class Database:
         finally:
             conn.close()
 
-    def insert_daily_activity(self, activity: DailyActivity) -> bool:
-        """Insert or update daily activity record.
+    @staticmethod
+    def _device_key(device_id: str | None) -> str:
+        return device_id or ""
 
-        Returns:
-            True if record was inserted, False if updated
-        """
+    @staticmethod
+    def _upsert(
+        conn: sqlite3.Connection,
+        table: str,
+        key_columns: tuple[str, ...],
+        values: dict[str, Any],
+    ) -> UpsertOutcome:
+        key_values = tuple(values[column] for column in key_columns)
+        predicate = " AND ".join(f"{column} = ?" for column in key_columns)
+        existing = conn.execute(
+            f"SELECT * FROM {table} WHERE {predicate}",
+            key_values,
+        ).fetchone()
+
+        if existing is None:
+            columns = tuple(values)
+            placeholders = ", ".join("?" for _ in columns)
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                tuple(values[column] for column in columns),
+            )
+            return UpsertOutcome.INSERTED
+
+        changed_values = {
+            column: value
+            for column, value in values.items()
+            if column != "id" and existing[column] != value
+        }
+        if not changed_values:
+            return UpsertOutcome.UNCHANGED
+
+        assignments = ", ".join(f"{column} = ?" for column in changed_values)
+        conn.execute(
+            f"UPDATE {table} SET {assignments}, updated_at = CURRENT_TIMESTAMP "
+            f"WHERE {predicate}",
+            (*changed_values.values(), *key_values),
+        )
+        return UpsertOutcome.UPDATED
+
+    def upsert_daily_activity(self, activity: DailyActivity) -> UpsertOutcome:
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO daily_activity (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, date, steps, distance_m, active_kcal,
-                    total_kcal, floors, active_minutes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, date, device_id) DO UPDATE SET
-                    steps = excluded.steps,
-                    distance_m = excluded.distance_m,
-                    active_kcal = excluded.active_kcal,
-                    total_kcal = excluded.total_kcal,
-                    floors = excluded.floors,
-                    active_minutes = excluded.active_minutes,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE excluded.steps > daily_activity.steps
-                """,
-                (
-                    activity.id,
-                    activity.provider,
-                    activity.source_type,
-                    activity.source_record_id,
-                    activity.user_id,
-                    activity.device_id,
-                    activity.timezone,
-                    activity.collected_at.isoformat() if activity.collected_at else None,
-                    activity.date,
-                    activity.steps,
-                    activity.distance_m,
-                    activity.active_kcal,
-                    activity.total_kcal,
-                    activity.floors,
-                    activity.active_minutes,
-                ),
+            outcome = self._upsert(
+                conn,
+                "daily_activity",
+                ("user_id", "date", "device_key"),
+                {
+                    "id": activity.id,
+                    "provider": activity.provider,
+                    "source_type": activity.source_type,
+                    "source_record_id": activity.source_record_id,
+                    "user_id": activity.user_id,
+                    "device_id": activity.device_id,
+                    "device_key": self._device_key(activity.device_id),
+                    "timezone": activity.timezone,
+                    "collected_at": (
+                        activity.collected_at.isoformat() if activity.collected_at else None
+                    ),
+                    "date": activity.date,
+                    "steps": activity.steps,
+                    "distance_m": activity.distance_m,
+                    "active_kcal": activity.active_kcal,
+                    "total_kcal": activity.total_kcal,
+                    "floors": activity.floors,
+                    "active_minutes": activity.active_minutes,
+                },
             )
             conn.commit()
-            return cursor.rowcount > 0
+            return outcome
+
+    def insert_daily_activity(self, activity: DailyActivity) -> bool:
+        return self.upsert_daily_activity(activity) == UpsertOutcome.INSERTED
+
+    def upsert_sleep_session(self, sleep: SleepSession) -> UpsertOutcome:
+        with self._get_connection() as conn:
+            outcome = self._upsert(
+                conn,
+                "sleep_sessions",
+                ("user_id", "sleep_id"),
+                {
+                    "id": sleep.id,
+                    "provider": sleep.provider,
+                    "source_type": sleep.source_type,
+                    "source_record_id": sleep.source_record_id,
+                    "user_id": sleep.user_id,
+                    "device_id": sleep.device_id,
+                    "timezone": sleep.timezone,
+                    "collected_at": sleep.collected_at.isoformat() if sleep.collected_at else None,
+                    "sleep_id": sleep.sleep_id,
+                    "local_date": sleep.local_date or sleep.start_at.date().isoformat(),
+                    "start_at": sleep.start_at.isoformat(),
+                    "end_at": sleep.end_at.isoformat(),
+                    "duration_minutes": sleep.duration_minutes,
+                    "time_asleep_minutes": sleep.time_asleep_minutes,
+                    "time_awake_minutes": sleep.time_awake_minutes,
+                    "rem_minutes": sleep.rem_minutes,
+                    "wake_count": sleep.wake_count,
+                    "sleep_score": sleep.sleep_score,
+                    "is_nap": sleep.is_nap,
+                    "stages": json.dumps([stage.model_dump() for stage in sleep.stages]),
+                },
+            )
+            conn.commit()
+            return outcome
 
     def insert_sleep_session(self, sleep: SleepSession) -> bool:
-        """Insert or update sleep session record."""
+        return self.upsert_sleep_session(sleep) == UpsertOutcome.INSERTED
+
+    def upsert_workout(self, workout: Workout) -> UpsertOutcome:
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO sleep_sessions (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, sleep_id, start_at, end_at, duration_minutes,
-                    time_asleep_minutes, time_awake_minutes, sleep_score, is_nap, stages
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, sleep_id) DO UPDATE SET
-                    duration_minutes = excluded.duration_minutes,
-                    time_asleep_minutes = excluded.time_asleep_minutes,
-                    time_awake_minutes = excluded.time_awake_minutes,
-                    sleep_score = excluded.sleep_score,
-                    stages = excluded.stages,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    sleep.id,
-                    sleep.provider,
-                    sleep.source_type,
-                    sleep.source_record_id,
-                    sleep.user_id,
-                    sleep.device_id,
-                    sleep.timezone,
-                    sleep.collected_at.isoformat() if sleep.collected_at else None,
-                    sleep.sleep_id,
-                    sleep.start_at.isoformat(),
-                    sleep.end_at.isoformat(),
-                    sleep.duration_minutes,
-                    sleep.time_asleep_minutes,
-                    sleep.time_awake_minutes,
-                    sleep.sleep_score,
-                    sleep.is_nap,
-                    json.dumps([s.model_dump() for s in sleep.stages]),
-                ),
+            outcome = self._upsert(
+                conn,
+                "workouts",
+                ("user_id", "workout_id"),
+                {
+                    "id": workout.id,
+                    "provider": workout.provider,
+                    "source_type": workout.source_type,
+                    "source_record_id": workout.source_record_id,
+                    "user_id": workout.user_id,
+                    "device_id": workout.device_id,
+                    "timezone": workout.timezone,
+                    "collected_at": (
+                        workout.collected_at.isoformat() if workout.collected_at else None
+                    ),
+                    "workout_id": workout.workout_id,
+                    "local_date": workout.local_date or workout.start_at.date().isoformat(),
+                    "activity_type": workout.activity_type,
+                    "start_at": workout.start_at.isoformat(),
+                    "end_at": workout.end_at.isoformat(),
+                    "duration_minutes": workout.duration_minutes,
+                    "distance_m": workout.distance_m,
+                    "calories_kcal": workout.calories_kcal,
+                    "avg_heart_rate_bpm": workout.avg_heart_rate_bpm,
+                    "max_heart_rate_bpm": workout.max_heart_rate_bpm,
+                    "avg_pace_sec_per_km": workout.avg_pace_sec_per_km,
+                    "max_pace_sec_per_km": workout.max_pace_sec_per_km,
+                    "total_steps": workout.total_steps,
+                },
             )
             conn.commit()
-            return cursor.rowcount > 0
+            return outcome
 
     def insert_workout(self, workout: Workout) -> bool:
-        """Insert or update workout record."""
+        return self.upsert_workout(workout) == UpsertOutcome.INSERTED
+
+    def upsert_body_measurement(self, measurement: BodyMeasurement) -> UpsertOutcome:
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO workouts (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, workout_id, activity_type, start_at, end_at,
-                    duration_minutes, distance_m, calories_kcal, avg_heart_rate_bpm,
-                    max_heart_rate_bpm, avg_pace_sec_per_km, max_pace_sec_per_km, total_steps
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, workout_id) DO UPDATE SET
-                    duration_minutes = excluded.duration_minutes,
-                    distance_m = excluded.distance_m,
-                    calories_kcal = excluded.calories_kcal,
-                    avg_heart_rate_bpm = excluded.avg_heart_rate_bpm,
-                    max_heart_rate_bpm = excluded.max_heart_rate_bpm,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    workout.id,
-                    workout.provider,
-                    workout.source_type,
-                    workout.source_record_id,
-                    workout.user_id,
-                    workout.device_id,
-                    workout.timezone,
-                    workout.collected_at.isoformat() if workout.collected_at else None,
-                    workout.workout_id,
-                    workout.activity_type,
-                    workout.start_at.isoformat(),
-                    workout.end_at.isoformat(),
-                    workout.duration_minutes,
-                    workout.distance_m,
-                    workout.calories_kcal,
-                    workout.avg_heart_rate_bpm,
-                    workout.max_heart_rate_bpm,
-                    workout.avg_pace_sec_per_km,
-                    workout.max_pace_sec_per_km,
-                    workout.total_steps,
-                ),
+            outcome = self._upsert(
+                conn,
+                "body_measurements",
+                ("user_id", "timestamp", "device_key"),
+                {
+                    "id": measurement.id,
+                    "provider": measurement.provider,
+                    "source_type": measurement.source_type,
+                    "source_record_id": measurement.source_record_id,
+                    "user_id": measurement.user_id,
+                    "device_id": measurement.device_id,
+                    "device_key": self._device_key(measurement.device_id),
+                    "timezone": measurement.timezone,
+                    "collected_at": (
+                        measurement.collected_at.isoformat() if measurement.collected_at else None
+                    ),
+                    "timestamp": measurement.timestamp.isoformat(),
+                    "local_date": measurement.local_date
+                    or measurement.timestamp.date().isoformat(),
+                    "weight_kg": measurement.weight_kg,
+                    "bmi": measurement.bmi,
+                    "body_fat_pct": measurement.body_fat_pct,
+                    "muscle_mass_kg": measurement.muscle_mass_kg,
+                    "water_pct": measurement.water_pct,
+                    "bone_mass_kg": measurement.bone_mass_kg,
+                    "visceral_fat_score": measurement.visceral_fat_score,
+                    "basal_metabolism_kcal": measurement.basal_metabolism_kcal,
+                    "metabolic_age": measurement.metabolic_age,
+                },
             )
             conn.commit()
-            return cursor.rowcount > 0
+            return outcome
 
     def insert_body_measurement(self, measurement: BodyMeasurement) -> bool:
-        """Insert or update body measurement record."""
+        return self.upsert_body_measurement(measurement) == UpsertOutcome.INSERTED
+
+    def upsert_heart_rate_sample(self, sample: HeartRateSample) -> UpsertOutcome:
         with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO body_measurements (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, timestamp, weight_kg, bmi, body_fat_pct,
-                    muscle_mass_kg, water_pct, bone_mass_kg, visceral_fat_score,
-                    basal_metabolism_kcal, metabolic_age
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, timestamp, device_id) DO UPDATE SET
-                    weight_kg = excluded.weight_kg,
-                    bmi = excluded.bmi,
-                    body_fat_pct = excluded.body_fat_pct,
-                    muscle_mass_kg = excluded.muscle_mass_kg,
-                    water_pct = excluded.water_pct,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    measurement.id,
-                    measurement.provider,
-                    measurement.source_type,
-                    measurement.source_record_id,
-                    measurement.user_id,
-                    measurement.device_id,
-                    measurement.timezone,
-                    measurement.collected_at.isoformat() if measurement.collected_at else None,
-                    measurement.timestamp.isoformat(),
-                    measurement.weight_kg,
-                    measurement.bmi,
-                    measurement.body_fat_pct,
-                    measurement.muscle_mass_kg,
-                    measurement.water_pct,
-                    measurement.bone_mass_kg,
-                    measurement.visceral_fat_score,
-                    measurement.basal_metabolism_kcal,
-                    measurement.metabolic_age,
-                ),
+            outcome = self._upsert(
+                conn,
+                "heart_rate_samples",
+                ("user_id", "timestamp", "sample_type"),
+                {
+                    "id": sample.id,
+                    "provider": sample.provider,
+                    "source_type": sample.source_type,
+                    "source_record_id": sample.source_record_id,
+                    "user_id": sample.user_id,
+                    "device_id": sample.device_id,
+                    "timezone": sample.timezone,
+                    "collected_at": sample.collected_at.isoformat() if sample.collected_at else None,
+                    "timestamp": sample.timestamp.isoformat(),
+                    "local_date": sample.local_date or sample.timestamp.date().isoformat(),
+                    "bpm": sample.bpm,
+                    "sample_type": sample.sample_type,
+                },
             )
             conn.commit()
-            return cursor.rowcount > 0
+            return outcome
 
     def insert_heart_rate_sample(self, sample: HeartRateSample) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO heart_rate_samples (
-                    id, provider, source_type, source_record_id, user_id, device_id,
-                    timezone, collected_at, timestamp, bpm, sample_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, timestamp, sample_type) DO UPDATE SET
-                    bpm = excluded.bpm,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    sample.id,
-                    sample.provider,
-                    sample.source_type,
-                    sample.source_record_id,
-                    sample.user_id,
-                    sample.device_id,
-                    sample.timezone,
-                    sample.collected_at.isoformat() if sample.collected_at else None,
-                    sample.timestamp.isoformat(),
-                    sample.bpm,
-                    sample.sample_type,
-                ),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+        return self.upsert_heart_rate_sample(sample) == UpsertOutcome.INSERTED
 
-    def update_sync_state(self, data_type: str, last_record_ts: datetime | None = None) -> None:
-        """Update sync state for a data type."""
+    def update_sync_state(
+        self,
+        source_type: str,
+        user_id: str,
+        data_type: str,
+        *,
+        cursor_date: str | None = None,
+        records_count: int = 0,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
         with self._get_connection() as conn:
             conn.execute(
                 """
-                INSERT INTO sync_state (data_type, last_sync_at, last_record_timestamp)
-                VALUES (?, CURRENT_TIMESTAMP, ?)
-                ON CONFLICT(data_type) DO UPDATE SET
-                    last_sync_at = CURRENT_TIMESTAMP,
-                    last_record_timestamp = excluded.last_record_timestamp
+                INSERT INTO sync_state (
+                    source_type,
+                    user_id,
+                    data_type,
+                    last_attempt_at,
+                    last_success_at,
+                    cursor_date,
+                    records_count,
+                    last_error
+                )
+                VALUES (
+                    ?,
+                    ?,
+                    ?,
+                    CURRENT_TIMESTAMP,
+                    CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    ?,
+                    ?,
+                    ?
+                )
+                ON CONFLICT(source_type, user_id, data_type) DO UPDATE SET
+                    last_attempt_at = CURRENT_TIMESTAMP,
+                    last_success_at = CASE
+                        WHEN ? THEN CURRENT_TIMESTAMP
+                        ELSE sync_state.last_success_at
+                    END,
+                    cursor_date = CASE
+                        WHEN ? THEN excluded.cursor_date
+                        ELSE sync_state.cursor_date
+                    END,
+                    records_count = excluded.records_count,
+                    last_error = excluded.last_error
                 """,
-                (data_type, last_record_ts.isoformat() if last_record_ts else None),
+                (
+                    source_type,
+                    user_id,
+                    data_type,
+                    success,
+                    cursor_date,
+                    records_count,
+                    error,
+                    success,
+                    success,
+                ),
             )
             conn.commit()
 
-    def get_sync_state(self, data_type: str) -> dict[str, Any] | None:
-        """Get sync state for a data type."""
+    def get_sync_state(
+        self,
+        source_type: str,
+        user_id: str,
+        data_type: str,
+    ) -> dict[str, Any] | None:
         with self._get_connection() as conn:
             row = conn.execute(
-                "SELECT * FROM sync_state WHERE data_type = ?",
-                (data_type,),
+                """
+                SELECT * FROM sync_state
+                WHERE source_type = ? AND user_id = ? AND data_type = ?
+                """,
+                (source_type, user_id, data_type),
             ).fetchone()
             return dict(row) if row else None
 
@@ -460,7 +371,7 @@ class Database:
                 """
                 SELECT * FROM sleep_sessions
                 WHERE user_id = ?
-                AND date(start_at) >= ? AND date(start_at) <= ?
+                AND local_date >= ? AND local_date <= ?
                 ORDER BY start_at
                 """,
                 (user_id, start_date, end_date),
@@ -479,7 +390,7 @@ class Database:
                 """
                 SELECT * FROM workouts
                 WHERE user_id = ?
-                AND date(start_at) >= ? AND date(start_at) <= ?
+                AND local_date >= ? AND local_date <= ?
                 ORDER BY start_at
                 """,
                 (user_id, start_date, end_date),
@@ -498,7 +409,7 @@ class Database:
                 """
                 SELECT * FROM body_measurements
                 WHERE user_id = ?
-                AND date(timestamp) >= ? AND date(timestamp) <= ?
+                AND local_date >= ? AND local_date <= ?
                 ORDER BY timestamp
                 """,
                 (user_id, start_date, end_date),
@@ -516,7 +427,7 @@ class Database:
                 """
                 SELECT * FROM heart_rate_samples
                 WHERE user_id = ?
-                AND date(timestamp) >= ? AND date(timestamp) <= ?
+                AND local_date >= ? AND local_date <= ?
                 ORDER BY timestamp
                 """,
                 (user_id, start_date, end_date),
@@ -552,9 +463,9 @@ class Database:
             row = conn.execute(
                 """
                 SELECT
-                    MIN(date(start_at)) as first_date,
-                    MAX(date(start_at)) as last_date,
-                    COUNT(DISTINCT date(start_at)) as days_with_data
+                    MIN(local_date) as first_date,
+                    MAX(local_date) as last_date,
+                    COUNT(DISTINCT local_date) as days_with_data
                 FROM sleep_sessions
                 WHERE user_id = ?
                 """,
@@ -572,9 +483,9 @@ class Database:
             row = conn.execute(
                 """
                 SELECT
-                    MIN(date(start_at)) as first_date,
-                    MAX(date(start_at)) as last_date,
-                    COUNT(DISTINCT date(start_at)) as days_with_data
+                    MIN(local_date) as first_date,
+                    MAX(local_date) as last_date,
+                    COUNT(DISTINCT local_date) as days_with_data
                 FROM workouts
                 WHERE user_id = ?
                 """,
@@ -592,9 +503,9 @@ class Database:
             row = conn.execute(
                 """
                 SELECT
-                    MIN(date(timestamp)) as first_date,
-                    MAX(date(timestamp)) as last_date,
-                    COUNT(DISTINCT date(timestamp)) as days_with_data
+                    MIN(local_date) as first_date,
+                    MAX(local_date) as last_date,
+                    COUNT(DISTINCT local_date) as days_with_data
                 FROM body_measurements
                 WHERE user_id = ?
                 """,
@@ -611,9 +522,9 @@ class Database:
             row = conn.execute(
                 """
                 SELECT
-                    MIN(date(timestamp)) as first_date,
-                    MAX(date(timestamp)) as last_date,
-                    COUNT(DISTINCT date(timestamp)) as days_with_data
+                    MIN(local_date) as first_date,
+                    MAX(local_date) as last_date,
+                    COUNT(DISTINCT local_date) as days_with_data
                 FROM heart_rate_samples
                 WHERE user_id = ?
                 """,

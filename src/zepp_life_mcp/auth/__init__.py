@@ -5,6 +5,7 @@ import webbrowser
 from contextlib import suppress
 
 import keyring
+from keyring.errors import PasswordDeleteError
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,11 @@ ACCOUNT_NAME = "zepp_auth"
 def save_token(token: str, user_id: str | None = None) -> None:
     keyring.set_password(SERVICE_NAME, f"{ACCOUNT_NAME}_token", token)
     if user_id:
-        keyring.set_password(SERVICE_NAME, f"{ACCOUNT_NAME}_user_id", user_id)
+        save_user_id(user_id)
+
+
+def save_user_id(user_id: str) -> None:
+    keyring.set_password(SERVICE_NAME, f"{ACCOUNT_NAME}_user_id", user_id)
 
 
 def load_token() -> tuple[str | None, str | None]:
@@ -28,9 +33,9 @@ def load_token() -> tuple[str | None, str | None]:
 
 
 def delete_token() -> None:
-    with suppress(keyring.errors.PasswordDeleteError):
+    with suppress(PasswordDeleteError):
         keyring.delete_password(SERVICE_NAME, f"{ACCOUNT_NAME}_token")
-    with suppress(keyring.errors.PasswordDeleteError):
+    with suppress(PasswordDeleteError):
         keyring.delete_password(SERVICE_NAME, f"{ACCOUNT_NAME}_user_id")
 
 

@@ -1,43 +1,85 @@
 """MCP server implementation for Zepp Life."""
 
+import asyncio
+import inspect
 import json
 import logging
 import uuid
-from datetime import datetime
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import CallToolResult, TextContent, Tool
 
+from zepp_life_mcp.adapters.base import DataAdapter
 from zepp_life_mcp.adapters.cloud_session import CloudSessionAdapter
 from zepp_life_mcp.adapters.export_file import ExportFileAdapter
 from zepp_life_mcp.auth import load_token
-from zepp_life_mcp.config import load_config
+from zepp_life_mcp.config import Config, load_config
 from zepp_life_mcp.models import ConnectionStatus, QueryResponse
 from zepp_life_mcp.services.query_service import QueryService
 from zepp_life_mcp.services.sync_service import SyncService
 from zepp_life_mcp.storage import Database
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create server
 app = Server("zepp-life-mcp")
 
-# Global services (initialized in main)
-config = None
-db = None
-adapter = None
-sync_service = None
-query_service = None
+
+@dataclass
+class RuntimeContext:
+    config: Config | None = None
+    db: Database | None = None
+    adapter: DataAdapter | None = None
+    sync_service: SyncService | None = None
+    query_service: QueryService | None = None
+    connect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available tools."""
-    return [
+context = RuntimeContext()
+CONNECTION_REQUIRED_TOOLS = {
+    "sync_data",
+    "get_profile",
+    "get_daily_summary",
+    "query_metric_series",
+    "query_sleep",
+    "query_workouts",
+    "query_heart_rate",
+    "query_body_measurements",
+    "get_data_coverage",
+}
+
+
+async def ensure_connected() -> bool:
+    if context.adapter is None:
+        return True
+    if context.db is None:
+        return False
+    if context.adapter.is_connected():
+        return True
+
+    async with context.connect_lock:
+        if context.adapter.is_connected():
+            return True
+        result = context.adapter.connect()
+        if inspect.isawaitable(result):
+            result = await result
+        if not result:
+            logger.warning("Failed to connect to data source")
+            return False
+
+        user_id = context.adapter.get_user_id() or "unknown"
+        context.sync_service = SyncService(context.adapter, context.db)
+        context.query_service = QueryService(context.db, user_id)
+        logger.info("Connected to data source")
+        return True
+
+
+TOOL_SPECS = (
         Tool(
             name="get_connection_status",
             description="Check connection status to data source and last sync time",
@@ -283,96 +325,86 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
-    ]
+)
+
+
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    return list(TOOL_SPECS)
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle tool calls."""
-    global config, db, adapter, sync_service, query_service
-
+async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     try:
-        if name == "get_connection_status":
-            result = await _handle_get_connection_status()
-        elif name == "sync_data":
-            result = await _handle_sync_data(arguments)
-        elif name == "get_profile":
-            result = await _handle_get_profile(arguments)
-        elif name == "get_daily_summary":
-            result = await _handle_get_daily_summary(arguments)
-        elif name == "query_metric_series":
-            result = await _handle_query_metric_series(arguments)
-        elif name == "query_sleep":
-            result = await _handle_query_sleep(arguments)
-        elif name == "query_workouts":
-            result = await _handle_query_workouts(arguments)
-        elif name == "query_heart_rate":
-            result = await _handle_query_heart_rate(arguments)
-        elif name == "query_body_measurements":
-            result = await _handle_query_body_measurements(arguments)
-        elif name == "get_data_coverage":
-            result = await _handle_get_data_coverage(arguments)
-        else:
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "status": "error",
-                            "error": f"Unknown tool: {name}",
-                        }
-                    ),
-                )
-            ]
-
-        return [TextContent(type="text", text=json.dumps(result, default=str))]
-
-    except Exception as e:
-        logger.exception(f"Error handling tool {name}")
-        return [
-            TextContent(
-                type="text",
-                text=json.dumps(
-                    {
-                        "status": "error",
-                        "error": str(e),
-                    }
-                ),
+        if name in CONNECTION_REQUIRED_TOOLS and not await ensure_connected():
+            result = {
+                "status": "error",
+                "error": "Data source connection failed",
+            }
+            return CallToolResult(
+                content=[TextContent(type="text", text=json.dumps(result))],
+                isError=True,
             )
-        ]
+        handler = TOOL_HANDLERS.get(name)
+        if handler is None:
+            result = {
+                "status": "error",
+                "error": f"Unknown tool: {name}",
+            }
+        else:
+            result = await handler(arguments)
+
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(result, default=str))],
+            isError=result.get("status") == "error",
+        )
+
+    except Exception:
+        logger.exception(f"Error handling tool {name}")
+        result = {
+            "status": "error",
+            "error": "Request failed",
+        }
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(result))],
+            isError=True,
+        )
 
 
-async def _handle_get_connection_status() -> dict:
-    """Handle get_connection_status tool."""
-    global adapter, config
-
-    if not config or config.mode == "not_configured":
+async def _handle_get_connection_status(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.config or context.config.mode == "not_configured":
         return ConnectionStatus(
             mode="not_configured",
             connected=False,
             message="Server not configured. Run 'zepp-mcp setup' first.",
         ).model_dump()
 
-    connected = adapter is not None and adapter.is_connected()
+    connected = context.adapter is not None and context.adapter.is_connected()
 
     # Get sync state from database
     last_sync = None
     available_types = []
 
-    if db:
+    if context.db and context.adapter:
+        source_type = context.config.mode
+        user_id = context.adapter.get_user_id() or "unknown"
         for data_type in ["daily_activity", "sleep", "heart_rate", "workouts", "body_measurements"]:
-            state = db.get_sync_state(data_type)
-            if state and state.get("last_sync_at"):
+            state = context.db.get_sync_state(source_type, user_id, data_type)
+            if state and state.get("last_success_at"):
                 available_types.append(data_type)
-                sync_time = datetime.fromisoformat(state["last_sync_at"])
+                sync_time = datetime.fromisoformat(state["last_success_at"])
                 if last_sync is None or sync_time > last_sync:
                     last_sync = sync_time
 
     # Determine sync health
     sync_health = "unknown"
     if last_sync:
-        age_minutes = (datetime.utcnow() - last_sync).total_seconds() / 60
-        sync_health = "healthy" if age_minutes < config.stale_after_minutes else "stale"
+        if last_sync.tzinfo is None:
+            last_sync = last_sync.replace(tzinfo=UTC)
+        age_minutes = (datetime.now(UTC) - last_sync).total_seconds() / 60
+        sync_health = (
+            "healthy" if age_minutes < context.config.stale_after_minutes else "stale"
+        )
 
     next_action = None
     if not connected:
@@ -383,41 +415,42 @@ async def _handle_get_connection_status() -> dict:
         next_action = "Run sync_data to import data"
 
     return ConnectionStatus(
-        mode=config.mode,
+        mode=context.config.mode,
         connected=connected,
         last_sync_at=last_sync,
         available_data_types=available_types,
         sync_health=sync_health,
         next_action=next_action,
+        message="Connection is deferred until the first data request" if not connected else None,
     ).model_dump()
 
 
-async def _handle_sync_data(arguments: dict) -> dict:
-    """Handle sync_data tool."""
-    global sync_service
-
-    if not sync_service:
+async def _handle_sync_data(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.sync_service:
         return {
             "status": "error",
             "error": "Sync service not initialized",
         }
 
-    data_types = arguments.get("data_types") or sync_service.adapter.get_available_data_types()
+    data_types = (
+        arguments.get("data_types") or context.sync_service.adapter.get_available_data_types()
+    )
     start_date = arguments.get("start_date")
     end_date = arguments.get("end_date")
     force_full = arguments.get("force_full_sync", False)
 
     sync_id = str(uuid.uuid4())
-    started_at = datetime.utcnow()
+    started_at = datetime.now(UTC)
 
     total_added = 0
     total_updated = 0
     total_skipped = 0
     types_synced = []
+    failed_data_types = []
 
     for data_type in data_types:
         try:
-            result = await sync_service.sync_data_type(
+            result = await context.sync_service.sync_data_type(
                 data_type=data_type,
                 start_date=start_date,
                 end_date=end_date,
@@ -429,11 +462,12 @@ async def _handle_sync_data(arguments: dict) -> dict:
             types_synced.append(data_type)
         except Exception as e:
             logger.error(f"Failed to sync {data_type}: {e}")
+            failed_data_types.append(data_type)
 
-    finished_at = datetime.utcnow()
+    finished_at = datetime.now(UTC)
 
     return {
-        "status": "ok",
+        "status": "ok" if types_synced else "error",
         "sync_id": sync_id,
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
@@ -441,25 +475,24 @@ async def _handle_sync_data(arguments: dict) -> dict:
         "records_updated": total_updated,
         "records_skipped": total_skipped,
         "data_types_synced": types_synced,
+        "failed_data_types": failed_data_types,
+        "error": "No data types synced successfully" if not types_synced else None,
     }
 
 
-async def _handle_get_profile(arguments: dict) -> dict:
-    """Handle get_profile tool."""
-    global adapter, config
-
-    if not adapter or not adapter.is_connected():
+async def _handle_get_profile(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.adapter or not context.adapter.is_connected():
         return {
             "status": "error",
             "error": "Not connected to data source",
         }
 
-    user_id = adapter.get_user_id() or "unknown"
+    user_id = context.adapter.get_user_id() or "unknown"
 
     profile = {
         "user_id": user_id,
         "display_name": None,
-        "timezone": config.timezone if config else "UTC",
+        "timezone": context.config.timezone if context.config else "UTC",
         "devices": [],
     }
 
@@ -469,16 +502,17 @@ async def _handle_get_profile(arguments: dict) -> dict:
 
     return QueryResponse(
         status="ok",
-        source=config.mode if config else "unknown",
+        source=(
+            context.config.mode
+            if context.config and context.config.mode != "not_configured"
+            else "unknown"
+        ),
         data={"profile": profile},
     ).model_dump()
 
 
-async def _handle_get_daily_summary(arguments: dict) -> dict:
-    """Handle get_daily_summary tool."""
-    global query_service, config
-
-    if not query_service:
+async def _handle_get_daily_summary(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -499,25 +533,25 @@ async def _handle_get_daily_summary(arguments: dict) -> dict:
         }
 
     try:
-        summaries = query_service.get_daily_summaries(start_date, end_date)
+        summaries = context.query_service.get_daily_summaries(start_date, end_date)
         return QueryResponse(
             status="ok",
             source="cache",
-            timezone=arguments.get("timezone", config.timezone if config else "UTC"),
+            timezone=arguments.get(
+                "timezone", context.config.timezone if context.config else "UTC"
+            ),
             data={"summaries": summaries},
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Daily summary query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
-async def _handle_query_metric_series(arguments: dict) -> dict:
-    """Handle query_metric_series tool."""
-    global query_service, config
-
-    if not query_service:
+async def _handle_query_metric_series(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -530,7 +564,7 @@ async def _handle_query_metric_series(arguments: dict) -> dict:
     aggregation = arguments.get("aggregation", "sum")
 
     try:
-        series = query_service.get_metric_series(
+        series = context.query_service.get_metric_series(
             metric=metric,
             start_date=start_date,
             end_date=end_date,
@@ -547,18 +581,16 @@ async def _handle_query_metric_series(arguments: dict) -> dict:
                 "series": series,
             },
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Metric series query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
-async def _handle_query_sleep(arguments: dict) -> dict:
-    """Handle query_sleep tool."""
-    global query_service, config
-
-    if not query_service:
+async def _handle_query_sleep(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -570,7 +602,7 @@ async def _handle_query_sleep(arguments: dict) -> dict:
     include_stages = arguments.get("include_stages", True)
 
     try:
-        sessions = query_service.get_sleep_sessions(
+        sessions = context.query_service.get_sleep_sessions(
             start_date=start_date,
             end_date=end_date,
             include_naps=include_naps,
@@ -588,18 +620,16 @@ async def _handle_query_sleep(arguments: dict) -> dict:
                 "total_sessions": len(sessions),
             },
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Sleep query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
-async def _handle_query_workouts(arguments: dict) -> dict:
-    """Handle query_workouts tool."""
-    global query_service, config
-
-    if not query_service:
+async def _handle_query_workouts(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -612,7 +642,7 @@ async def _handle_query_workouts(arguments: dict) -> dict:
     min_distance_km = arguments.get("min_distance_km")
 
     try:
-        workouts = query_service.get_workouts(
+        workouts = context.query_service.get_workouts(
             start_date=start_date,
             end_date=end_date,
             activity_types=activity_types,
@@ -638,17 +668,16 @@ async def _handle_query_workouts(arguments: dict) -> dict:
                 },
             },
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Workout query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
-async def _handle_query_heart_rate(arguments: dict) -> dict:
-    global query_service
-
-    if not query_service:
+async def _handle_query_heart_rate(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -660,7 +689,7 @@ async def _handle_query_heart_rate(arguments: dict) -> dict:
     limit = arguments.get("limit")
 
     try:
-        samples = query_service.get_heart_rate_samples(
+        samples = context.query_service.get_heart_rate_samples(
             start_date=start_date,
             end_date=end_date,
             sample_type=sample_type,
@@ -674,18 +703,16 @@ async def _handle_query_heart_rate(arguments: dict) -> dict:
                 "count": len(samples),
             },
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Heart rate query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
-async def _handle_query_body_measurements(arguments: dict) -> dict:
-    """Handle query_body_measurements tool."""
-    global query_service, config
-
-    if not query_service:
+async def _handle_query_body_measurements(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -697,7 +724,7 @@ async def _handle_query_body_measurements(arguments: dict) -> dict:
     latest_only = arguments.get("latest_only", False)
 
     try:
-        measurements = query_service.get_body_measurements(
+        measurements = context.query_service.get_body_measurements(
             start_date=start_date,
             end_date=end_date,
             metrics=metrics,
@@ -714,18 +741,16 @@ async def _handle_query_body_measurements(arguments: dict) -> dict:
                 "count": len(measurements),
             },
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Body measurement query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
-async def _handle_get_data_coverage(arguments: dict) -> dict:
-    """Handle get_data_coverage tool."""
-    global query_service
-
-    if not query_service:
+async def _handle_get_data_coverage(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
         return {
             "status": "error",
             "error": "Query service not initialized",
@@ -734,55 +759,80 @@ async def _handle_get_data_coverage(arguments: dict) -> dict:
     data_types = arguments.get("data_types")
 
     try:
-        coverage = query_service.get_data_coverage(data_types)
+        coverage = context.query_service.get_data_coverage(data_types)
         return QueryResponse(
             status="ok",
             source="cache",
             data={"coverage": coverage},
         ).model_dump()
-    except Exception as e:
+    except Exception:
+        logger.exception("Data coverage query failed")
         return {
             "status": "error",
-            "error": str(e),
+            "error": "Request failed",
         }
 
 
+ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "get_connection_status": _handle_get_connection_status,
+    "sync_data": _handle_sync_data,
+    "get_profile": _handle_get_profile,
+    "get_daily_summary": _handle_get_daily_summary,
+    "query_metric_series": _handle_query_metric_series,
+    "query_sleep": _handle_query_sleep,
+    "query_workouts": _handle_query_workouts,
+    "query_heart_rate": _handle_query_heart_rate,
+    "query_body_measurements": _handle_query_body_measurements,
+    "get_data_coverage": _handle_get_data_coverage,
+}
+
+
+async def close_runtime_context() -> None:
+    if context.adapter is None:
+        return
+    close = getattr(context.adapter, "close", None)
+    if close is None:
+        return
+    result = close()
+    if inspect.isawaitable(result):
+        await result
+
+
 async def main():
-    """Main entry point."""
-    global config, db, adapter, sync_service, query_service
+    context.config = load_config()
+    context.db = Database(context.config.database_path)
 
-    # Load configuration
-    config = load_config()
-
-    # Initialize database
-    db = Database(config.database_path)
-
-    # Initialize adapter if configured
-    if config.mode == "export_file" and config.export_path:
-        adapter = ExportFileAdapter(config.export_path)
-        if adapter.connect():
-            logger.info(f"Connected to export files at {config.export_path}")
+    if context.config.mode == "export_file" and context.config.export_path:
+        context.adapter = ExportFileAdapter(context.config.export_path)
+        if context.adapter.connect():
+            logger.info(f"Connected to export files at {context.config.export_path}")
         else:
-            logger.warning(f"Failed to connect to export files at {config.export_path}")
-    elif config.mode == "cloud_session":
+            logger.warning(f"Failed to connect to export files at {context.config.export_path}")
+    elif context.config.mode == "cloud_session":
         token, user_id = load_token()
         if token:
-            adapter = CloudSessionAdapter(token, user_id)
-            if await adapter.connect():
-                logger.info("Connected to Zepp cloud API")
-            else:
-                logger.warning("Failed to connect to Zepp cloud API")
-    # Initialize services
-    if adapter:
-        sync_service = SyncService(adapter, db)
-        query_service = QueryService(db, adapter.get_user_id() or "unknown")
-    else:
-        query_service = QueryService(db, "unknown")
-
-    # Run server
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(
-            read_stream,
-            write_stream,
-            app.create_initialization_options(),
+            context.adapter = CloudSessionAdapter(
+                token,
+                user_id,
+                context.config.region,
+                context.config.timezone,
+            )
+    if context.adapter and context.adapter.is_connected():
+        context.sync_service = SyncService(context.adapter, context.db)
+        context.query_service = QueryService(
+            context.db, context.adapter.get_user_id() or "unknown"
         )
+    else:
+        context.query_service = QueryService(context.db, "unknown")
+
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await app.run(
+                read_stream,
+                write_stream,
+                app.create_initialization_options(),
+            )
+    finally:
+        await close_runtime_context()

@@ -4,22 +4,41 @@ import base64
 import json
 import logging
 from collections.abc import AsyncIterator
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
-from zepp_life_mcp.adapters.base import DataAdapter
+from zepp_life_mcp.adapters.base import DataAdapter, parse_sleep_summary
+from zepp_life_mcp.auth import save_user_id
 from zepp_life_mcp.models import (
     BodyMeasurement,
     DailyActivity,
     HeartRateSample,
     SleepSession,
-    SleepStage,
     Workout,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class AdapterFetchError(RuntimeError):
+    pass
+
+SPORT_TYPE_MAP = {
+    "1": "running",
+    "6": "walking",
+    "8": "treadmill",
+    "9": "cycling",
+    "10": "indoor_cycling",
+    "11": "treadmill",
+    "12": "elliptical",
+    "13": "rowing",
+    "14": "pool_swimming",
+    "16": "freestyle",
+    "17": "jump_rope",
+}
 
 
 class CloudSessionAdapter(DataAdapter):
@@ -35,13 +54,26 @@ class CloudSessionAdapter(DataAdapter):
         app_token: str | None = None,
         user_id: str | None = None,
         region: str = "eu",
+        timezone: str = "UTC",
     ):
         self.app_token = app_token
         self.user_id = user_id
         self.region = region
+        self.timezone = timezone
+        self._timezone = ZoneInfo(timezone)
         self._connected = False
         self._client: httpx.AsyncClient | None = None
         self._available_types: list[str] = []
+
+    def _utc_from_timestamp(self, value: int | float) -> datetime:
+        return datetime.fromtimestamp(value, UTC)
+
+    def _local_date(self, value: datetime) -> str:
+        return value.astimezone(self._timezone).date().isoformat()
+
+    def _local_midnight_utc(self, value: str) -> datetime:
+        local_midnight = datetime.combine(date.fromisoformat(value), time(), self._timezone)
+        return local_midnight.astimezone(UTC)
 
     async def connect(self) -> bool:
         if not self.app_token:
@@ -63,13 +95,22 @@ class CloudSessionAdapter(DataAdapter):
             user_info = await self._get_user_info()
             if user_info:
                 self.user_id = user_info.get("user_id") or self.user_id
+                if not self.user_id:
+                    self.user_id = await self._discover_user_id()
+                    if self.user_id:
+                        save_user_id(self.user_id)
+                if not self.user_id:
+                    raise RuntimeError("Could not discover Zepp user id")
                 self._connected = True
                 self._available_types = await self._discover_data_types()
-                logger.info(f"Connected to Zepp API as user {self.user_id}")
+                logger.info("Connected to Zepp API")
                 return True
         except Exception as e:
             logger.error(f"Failed to connect: {e}")
 
+        if self._client:
+            await self._client.aclose()
+            self._client = None
         return False
 
     def is_connected(self) -> bool:
@@ -81,7 +122,7 @@ class CloudSessionAdapter(DataAdapter):
     def get_available_data_types(self) -> list[str]:
         return self._available_types.copy()
 
-    def _parse_band_data(self, data: dict) -> Any:
+    def _parse_band_data(self, data: dict[str, Any]) -> Any:
         """Parse band data from API response."""
         try:
             if "data" in data:
@@ -92,6 +133,7 @@ class CloudSessionAdapter(DataAdapter):
                 return json.loads(decoded)
         except Exception as e:
             logger.error(f"Failed to parse band data: {e}")
+            raise ValueError("Invalid band data payload") from e
 
         return data
 
@@ -131,9 +173,41 @@ class CloudSessionAdapter(DataAdapter):
             return hr_values
         except Exception as e:
             logger.error(f"Failed to parse heart rate data: {e}")
-            return []
+            raise ValueError("Invalid heart rate payload") from e
 
-    async def _get_user_info(self) -> dict | None:
+    async def _discover_user_id(self) -> str | None:
+        client = self._client
+        if client is None:
+            return None
+
+        today = datetime.now(self._timezone).date()
+        start_date = (today - timedelta(days=30)).isoformat()
+        try:
+            response = await client.get(
+                "/v1/data/band_data.json",
+                params={
+                    "query_type": "summary",
+                    "device_type": "android_phone",
+                    "from_date": start_date,
+                    "to_date": today.isoformat(),
+                },
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json().get("data", [])
+            if not isinstance(data, list):
+                return None
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                user_id = str(item.get("uid", ""))
+                if user_id.isdigit():
+                    return user_id
+        except Exception as exc:
+            logger.error(f"Failed to discover user id: {exc}")
+        return None
+
+    async def _get_user_info(self) -> dict[str, Any] | None:
         if not self._client:
             return None
 
@@ -151,16 +225,21 @@ class CloudSessionAdapter(DataAdapter):
 
     async def _discover_data_types(self) -> list[str]:
         types = []
+        client = self._client
+        if client is None:
+            return types
+        today = datetime.now(self._timezone).date()
+        start_date = (today - timedelta(days=30)).isoformat()
 
         try:
-            response = await self._client.get(
+            response = await client.get(
                 "/v1/data/band_data.json",
                 params={
                     "query_type": "summary",
                     "device_type": "android_phone",
                     "userid": self.user_id,
-                    "from_date": "2020-01-01",
-                    "to_date": datetime.now().strftime("%Y-%m-%d"),
+                    "from_date": start_date,
+                    "to_date": today.isoformat(),
                 },
             )
             if response.status_code == 200:
@@ -172,28 +251,28 @@ class CloudSessionAdapter(DataAdapter):
                     if day_data.get("slp"):
                         types.append("sleep")
                     break
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Capability discovery failed for band summary: {exc}")
 
         try:
-            response = await self._client.get(
+            response = await client.get(
                 "/v1/sport/run/history.json",
                 params={"limit": 1},
             )
             if response.status_code == 200:
                 types.append("workouts")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Capability discovery failed for workouts: {exc}")
 
         try:
-            response = await self._client.get(
+            response = await client.get(
                 "/v1/data/band_data.json",
                 params={
                     "query_type": "detail",
                     "device_type": "android_phone",
                     "userid": self.user_id,
-                    "from_date": "2020-01-01",
-                    "to_date": datetime.now().strftime("%Y-%m-%d"),
+                    "from_date": start_date,
+                    "to_date": today.isoformat(),
                 },
             )
             if response.status_code == 200:
@@ -201,16 +280,16 @@ class CloudSessionAdapter(DataAdapter):
                     if self._parse_heart_rate_data(item.get("data_hr", "")):
                         types.append("heart_rate")
                         break
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Capability discovery failed for heart rate: {exc}")
 
         try:
             url = f"{self.ZEPP_WEIGHT_API}/users/{self.user_id}/members/-1/weightRecords?limit=1"
-            response = await self._client.get(url)
+            response = await client.get(url)
             if response.status_code == 200:
                 types.append("body_measurements")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Capability discovery failed for body measurements: {exc}")
 
         return list(set(types))
 
@@ -224,7 +303,7 @@ class CloudSessionAdapter(DataAdapter):
             yield
 
         if not end_date:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date = datetime.now(self._timezone).date().isoformat()
         if not start_date:
             start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=30)
             start_date = start_dt.strftime("%Y-%m-%d")
@@ -242,8 +321,9 @@ class CloudSessionAdapter(DataAdapter):
             )
 
             if response.status_code != 200:
-                logger.error(f"Failed to fetch activity: {response.status_code}")
-                return
+                raise AdapterFetchError(
+                    f"Failed to fetch daily activity: HTTP {response.status_code}"
+                )
 
             data = response.json()
             parsed_data = self._parse_band_data(data)
@@ -252,18 +332,27 @@ class CloudSessionAdapter(DataAdapter):
                 steps_data = day_data.get("stp", {})
                 if steps_data:
                     yield DailyActivity(
-                        id=f"cloud_{date_str}",
+                        id=f"cloud_{self.user_id}_{date_str}",
                         provider="zepp_life",
                         source_type="cloud_session",
+                        source_record_id=None,
                         user_id=self.user_id or "unknown",
+                        device_id=None,
+                        collected_at=None,
                         date=date_str,
                         steps=steps_data.get("ttl", 0),
                         distance_m=steps_data.get("dis", 0),
                         active_kcal=steps_data.get("cal", 0),
+                        total_kcal=None,
+                        floors=None,
+                        active_minutes=None,
                     )
 
-        except Exception as e:
-            logger.error(f"Error fetching activity: {e}")
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching activity: {exc}")
+            raise AdapterFetchError("Failed to fetch daily activity") from exc
 
     async def iter_sleep_sessions(
         self,
@@ -275,7 +364,7 @@ class CloudSessionAdapter(DataAdapter):
             yield
 
         if not end_date:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date = datetime.now(self._timezone).date().isoformat()
         if not start_date:
             start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=30)
             start_date = start_dt.strftime("%Y-%m-%d")
@@ -293,8 +382,7 @@ class CloudSessionAdapter(DataAdapter):
             )
 
             if response.status_code != 200:
-                logger.error(f"Failed to fetch sleep: {response.status_code}")
-                return
+                raise AdapterFetchError(f"Failed to fetch sleep: HTTP {response.status_code}")
 
             data = response.json()
             parsed_data = self._parse_band_data(data)
@@ -306,51 +394,44 @@ class CloudSessionAdapter(DataAdapter):
 
                 start_ts = sleep_data.get("st")
                 end_ts = sleep_data.get("ed")
-                asleep_minutes = sleep_data.get("dp", 0) + sleep_data.get("lt", 0)
+                metrics = parse_sleep_summary(sleep_data)
 
-                if not start_ts or not end_ts or (end_ts <= start_ts and asleep_minutes <= 0):
+                if not start_ts or not end_ts or (end_ts <= start_ts and metrics.duration_minutes <= 0):
                     continue
 
-                start_dt = datetime.fromtimestamp(start_ts)
-                end_dt = datetime.fromtimestamp(end_ts)
-                duration = int((end_dt - start_dt).total_seconds() / 60)
-                if duration < 0:
-                    duration = asleep_minutes
-
-                stages = []
-                stage_data = sleep_data.get("stage", [])
-                for stage in stage_data:
-                    mode = stage.get("mode")
-                    if mode == 5:
-                        stage_type = "deep"
-                    elif mode == 4:
-                        stage_type = "light"
-                    elif mode == 3:
-                        stage_type = "rem"
-                    else:
-                        stage_type = "awake"
-                    stage_stop = stage.get("stop", stage.get("end", 0))
-                    stage_duration = max(0, stage_stop - stage.get("start", 0))
-                    if stage_duration:
-                        stages.append(SleepStage(stage=stage_type, minutes=stage_duration))
-
-                total_duration = max(duration, asleep_minutes)
-                yield SleepSession(
-                    id=f"cloud_sleep_{date_str}",
+                start_dt = self._utc_from_timestamp(start_ts)
+                end_dt = self._utc_from_timestamp(end_ts)
+                sleep = SleepSession(
+                    id=f"cloud_sleep_{self.user_id}_{date_str}",
                     provider="zepp_life",
                     source_type="cloud_session",
+                    source_record_id=None,
                     user_id=self.user_id or "unknown",
+                    device_id=None,
+                    collected_at=None,
                     sleep_id=f"sleep_{date_str}",
+                    timezone=self.timezone,
+                    local_date=self._local_date(start_dt),
                     start_at=start_dt,
                     end_at=end_dt,
-                    duration_minutes=total_duration,
-                    time_asleep_minutes=asleep_minutes,
-                    time_awake_minutes=max(0, total_duration - asleep_minutes),
-                    stages=stages,
+                    duration_minutes=metrics.duration_minutes,
+                    time_asleep_minutes=metrics.time_asleep_minutes,
+                    time_awake_minutes=metrics.awake_minutes,
+                    sleep_score=metrics.score,
+                    stages=metrics.stages,
+                )
+                yield sleep.model_copy(
+                    update={
+                        "rem_minutes": metrics.rem_minutes,
+                        "wake_count": metrics.wake_count,
+                    }
                 )
 
-        except Exception as e:
-            logger.error(f"Error fetching sleep: {e}")
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching sleep: {exc}")
+            raise AdapterFetchError("Failed to fetch sleep") from exc
 
     async def iter_heart_rate(
         self,
@@ -362,10 +443,58 @@ class CloudSessionAdapter(DataAdapter):
             yield
 
         if not end_date:
-            end_date = datetime.now().strftime("%Y-%m-%d")
+            end_date = datetime.now(self._timezone).date().isoformat()
         if not start_date:
             start_dt = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=7)
             start_date = start_dt.strftime("%Y-%m-%d")
+
+        try:
+            response = await self._client.get(
+                "/v1/data/band_data.json",
+                params={
+                    "query_type": "summary",
+                    "device_type": "android_phone",
+                    "userid": self.user_id,
+                    "from_date": start_date,
+                    "to_date": end_date,
+                },
+            )
+            if response.status_code != 200:
+                raise AdapterFetchError(
+                    f"Failed to fetch resting heart rate: HTTP {response.status_code}"
+                )
+            parsed_data = self._parse_band_data(response.json())
+            for date_str, day_data in self._iter_band_summary_entries(parsed_data):
+                sleep_data = day_data.get("slp", {})
+                resting_bpm = sleep_data.get("rhr")
+                end_ts = sleep_data.get("ed")
+                try:
+                    resting_bpm = int(resting_bpm)
+                    end_ts = int(end_ts)
+                except (TypeError, ValueError):
+                    continue
+                if resting_bpm <= 0 or end_ts <= 0:
+                    continue
+                timestamp = self._utc_from_timestamp(end_ts)
+                yield HeartRateSample(
+                    id=f"cloud_rhr_{self.user_id}_{date_str}",
+                    provider="zepp_life",
+                    source_type="cloud_session",
+                    source_record_id=f"sleep_{date_str}",
+                    user_id=self.user_id or "unknown",
+                    device_id=None,
+                    collected_at=None,
+                    timezone=self.timezone,
+                    timestamp=timestamp,
+                    local_date=self._local_date(timestamp),
+                    bpm=resting_bpm,
+                    sample_type="resting",
+                )
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching resting heart rate: {exc}")
+            raise AdapterFetchError("Failed to fetch resting heart rate") from exc
 
         try:
             response = await self._client.get(
@@ -380,8 +509,7 @@ class CloudSessionAdapter(DataAdapter):
             )
 
             if response.status_code != 200:
-                logger.error(f"Failed to fetch heart rate: {response.status_code}")
-                return
+                raise AdapterFetchError(f"Failed to fetch heart rate: HTTP {response.status_code}")
 
             data = response.json()
 
@@ -391,22 +519,30 @@ class CloudSessionAdapter(DataAdapter):
 
                 if hr_data:
                     hr_values = self._parse_heart_rate_data(hr_data)
-                    base_time = datetime.strptime(date_str, "%Y-%m-%d")
+                    base_time = self._local_midnight_utc(date_str)
 
                     for minute, bpm in hr_values:
                         timestamp = base_time + timedelta(minutes=minute)
                         yield HeartRateSample(
-                            id=f"cloud_hr_{date_str}_{minute}",
+                            id=f"cloud_hr_{self.user_id}_{date_str}_{minute}",
                             provider="zepp_life",
                             source_type="cloud_session",
+                            source_record_id=None,
                             user_id=self.user_id or "unknown",
+                            device_id=None,
+                            collected_at=None,
+                            timezone=self.timezone,
                             timestamp=timestamp,
+                            local_date=date_str,
                             bpm=bpm,
                             sample_type="passive",
                         )
 
-        except Exception as e:
-            logger.error(f"Error fetching heart rate: {e}")
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching heart rate: {exc}")
+            raise AdapterFetchError("Failed to fetch heart rate") from exc
 
     async def iter_workouts(
         self,
@@ -424,8 +560,7 @@ class CloudSessionAdapter(DataAdapter):
             )
 
             if response.status_code != 200:
-                logger.error(f"Failed to fetch workouts: {response.status_code}")
-                return
+                raise AdapterFetchError(f"Failed to fetch workouts: HTTP {response.status_code}")
 
             data = response.json()
 
@@ -440,26 +575,32 @@ class CloudSessionAdapter(DataAdapter):
                     if start_time
                     else (end_ts - duration_sec if end_ts else None)
                 )
+                start_at = self._utc_from_timestamp(start_ts) if start_ts else datetime.now(UTC)
+                workout_date = self._local_date(start_at)
 
                 if start_ts:
-                    workout_date = datetime.fromtimestamp(start_ts).strftime("%Y-%m-%d")
-
                     if start_date and workout_date < start_date:
                         continue
                     if end_date and workout_date > end_date:
                         continue
 
                 duration_min = int(float(run_time)) // 60 if run_time else 0
+                raw_type = str(item.get("type", "unknown"))
 
                 yield Workout(
-                    id=f"cloud_{item.get('trackid')}",
+                    id=f"cloud_{self.user_id}_{item.get('trackid')}",
                     provider="zepp_life",
                     source_type="cloud_session",
+                    source_record_id=None,
                     user_id=self.user_id or "unknown",
+                    device_id=None,
+                    collected_at=None,
                     workout_id=str(item.get("trackid")),
-                    activity_type=str(item.get("type", "unknown")),
-                    start_at=datetime.fromtimestamp(start_ts) if start_ts else datetime.now(),
-                    end_at=datetime.fromtimestamp(end_ts) if end_ts else datetime.now(),
+                    timezone=self.timezone,
+                    local_date=workout_date,
+                    activity_type=SPORT_TYPE_MAP.get(raw_type, raw_type),
+                    start_at=start_at,
+                    end_at=self._utc_from_timestamp(end_ts) if end_ts else datetime.now(UTC),
                     duration_minutes=duration_min,
                     distance_m=float(item.get("dis", 0)) if item.get("dis") else None,
                     calories_kcal=float(item.get("calorie", 0)) if item.get("calorie") else None,
@@ -469,10 +610,16 @@ class CloudSessionAdapter(DataAdapter):
                     max_heart_rate_bpm=int(float(item.get("max_heart_rate")))
                     if item.get("max_heart_rate")
                     else None,
+                    avg_pace_sec_per_km=None,
+                    max_pace_sec_per_km=None,
+                    total_steps=None,
                 )
 
-        except Exception as e:
-            logger.error(f"Error fetching workouts: {e}")
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching workouts: {exc}")
+            raise AdapterFetchError("Failed to fetch workouts") from exc
 
     async def iter_body_measurements(
         self,
@@ -490,16 +637,19 @@ class CloudSessionAdapter(DataAdapter):
             response = await self._client.get(url, params=params)
 
             if response.status_code != 200:
-                logger.error(f"Failed to fetch weight: {response.status_code}")
-                return
+                raise AdapterFetchError(
+                    f"Failed to fetch body measurements: HTTP {response.status_code}"
+                )
 
             data = response.json()
 
             for item in data.get("items", []):
                 record_time = item.get("generatedTime")
+                timestamp = (
+                    self._utc_from_timestamp(record_time) if record_time else datetime.now(UTC)
+                )
+                record_date = self._local_date(timestamp)
                 if record_time:
-                    record_date = datetime.fromtimestamp(record_time).strftime("%Y-%m-%d")
-
                     if start_date and record_date < start_date:
                         continue
                     if end_date and record_date > end_date:
@@ -508,13 +658,16 @@ class CloudSessionAdapter(DataAdapter):
                 summary = item.get("summary", {})
 
                 yield BodyMeasurement(
-                    id=f"cloud_weight_{item.get('id', record_time)}",
+                    id=f"cloud_weight_{self.user_id}_{item.get('id', record_time)}",
                     provider="zepp_life",
                     source_type="cloud_session",
+                    source_record_id=None,
                     user_id=self.user_id or "unknown",
-                    timestamp=datetime.fromtimestamp(record_time)
-                    if record_time
-                    else datetime.now(),
+                    device_id=None,
+                    collected_at=None,
+                    timezone=self.timezone,
+                    local_date=record_date,
+                    timestamp=timestamp,
                     weight_kg=summary.get("weight", 0),
                     bmi=summary.get("bmi"),
                     body_fat_pct=summary.get("fatRate"),
@@ -532,8 +685,11 @@ class CloudSessionAdapter(DataAdapter):
                     else None,
                 )
 
-        except Exception as e:
-            logger.error(f"Error fetching weight: {e}")
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching weight: {exc}")
+            raise AdapterFetchError("Failed to fetch body measurements") from exc
 
     async def close(self):
         if self._client:
