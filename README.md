@@ -23,7 +23,35 @@ The current implementation supports:
 - workouts with readable sport names for known Zepp sport codes
 - weight and body-composition measurements
 
-Cloud coverage can vary by account, region, and upstream endpoint stability. Export mode is the safest option when you need predictable full-history access.
+Cloud coverage can vary by account, region, and upstream endpoint stability.
+
+### Raw payload archive
+
+Every upstream response is also stored verbatim in the `raw_payloads` table (gzipped,
+deduplicated by content hash). The typed tables are deliberately narrow — Zepp returns
+193 fields per workout and the schema keeps 8 — so the archive is what makes a later
+mapping change backfillable from local data rather than requiring a refetch from an
+account that may no longer serve the history.
+
+```python
+from zepp_life_mcp.storage import Database
+
+db = Database("~/.local/share/zepp-life-mcp/zepp_life.db")
+db.raw_payload_stats()                                   # what is archived
+for row in db.read_raw_payloads(endpoint="sport.run.history"):
+    row["payload"]                                       # the original JSON
+```
+
+Set `store_raw_payloads` to `false` in the config to turn this off.
+
+### Upstream row cap
+
+`band_data.json` truncates any response to 500 rows and drops the **most recent** dates
+when it does, while still answering HTTP 200. Sync therefore splits wide ranges into
+windows that stay under the cap; a window that still returns at the cap (a multi-device
+account emits one row per date *per device*) halves itself and retries. A single
+unwindowed request for `2020-01-01`..today was measured returning history that stopped
+two months early.
 
 Cloud connections are lazy: server startup and `tools/list` do not wait for Zepp login. The first data tool establishes one shared connection. If `user_id` is omitted, the adapter attempts to discover the numeric UID from the last 30 days of band summary data and stores it in the system keyring.
 

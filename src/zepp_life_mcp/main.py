@@ -180,7 +180,7 @@ async def cmd_sync_async(args):
         print(f"❌ Неизвестный режим: {config.mode}")
         sys.exit(1)
 
-    sync_service = SyncService(adapter, db)
+    sync_service = SyncService(adapter, db, archive_raw=config.store_raw_payloads)
     data_types = [args.type] if args.type else adapter.get_available_data_types()
     print(f"Синхронизация {len(data_types)} типов данных...")
     print()

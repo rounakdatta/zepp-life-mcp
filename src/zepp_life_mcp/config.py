@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 DEPRECATED_NO_OP_KEYS = (
     "auto_sync_on_start",
-    "store_raw_payloads",
     "default_lookback_days",
     "logs_path",
 )
@@ -45,7 +44,7 @@ class Config(BaseModel):
     stale_after_minutes: int = 60
     store_raw_payloads: bool = Field(
         default=True,
-        json_schema_extra=DEPRECATED_NO_OP_SCHEMA,
+        description="Archive every upstream response verbatim in the raw_payloads table",
     )
     default_lookback_days: int = Field(
         default=30,

@@ -15,15 +15,22 @@ logger = logging.getLogger(__name__)
 class SyncService:
     """Service for synchronizing data from adapters to local database."""
 
-    def __init__(self, adapter: DataAdapter, db: Database):
+    def __init__(self, adapter: DataAdapter, db: Database, archive_raw: bool = True):
         """Initialize sync service.
 
         Args:
             adapter: Data source adapter
             db: Database instance
+            archive_raw: Persist every upstream response verbatim alongside the
+                mapped records, so fields the typed schema drops stay recoverable
         """
         self.adapter = adapter
         self.db = db
+        self.archive_raw = archive_raw
+
+        set_raw_sink = getattr(adapter, "set_raw_sink", None)
+        if callable(set_raw_sink):
+            set_raw_sink(db.record_raw_payload if archive_raw else None)
 
     async def _iterate_records(self, records: Any) -> AsyncIterator[Any]:
         if hasattr(records, "__aiter__"):

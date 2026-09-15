@@ -73,7 +73,11 @@ async def ensure_connected() -> bool:
             return False
 
         user_id = context.adapter.get_user_id() or "unknown"
-        context.sync_service = SyncService(context.adapter, context.db)
+        context.sync_service = SyncService(
+            context.adapter,
+            context.db,
+            archive_raw=context.config.store_raw_payloads if context.config else True,
+        )
         context.query_service = QueryService(context.db, user_id)
         logger.info("Connected to data source")
         return True
@@ -820,7 +824,11 @@ async def main():
                 context.config.timezone,
             )
     if context.adapter and context.adapter.is_connected():
-        context.sync_service = SyncService(context.adapter, context.db)
+        context.sync_service = SyncService(
+            context.adapter,
+            context.db,
+            archive_raw=context.config.store_raw_payloads if context.config else True,
+        )
         context.query_service = QueryService(
             context.db, context.adapter.get_user_id() or "unknown"
         )

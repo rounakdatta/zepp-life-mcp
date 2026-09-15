@@ -1,7 +1,10 @@
 """SQLite storage layer for Zepp MCP."""
 
+import gzip
+import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -263,6 +266,121 @@ class Database:
 
     def insert_heart_rate_sample(self, sample: HeartRateSample) -> bool:
         return self.upsert_heart_rate_sample(sample) == UpsertOutcome.INSERTED
+
+    def record_raw_payload(
+        self,
+        *,
+        source_type: str,
+        user_id: str,
+        endpoint: str,
+        payload: Any,
+        request_params: dict[str, Any] | None = None,
+        window_start: str | None = None,
+        window_end: str | None = None,
+        http_status: int | None = None,
+        provider: str = "zepp_life",
+    ) -> bool:
+        """Archive one upstream response verbatim, gzipped.
+
+        Returns True when a new row was written, False when an identical payload
+        for the same endpoint and window is already archived. Re-fetching a
+        window whose content has changed appends a new row rather than
+        overwriting, so the archive is append-only and never loses a version.
+        """
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(body).hexdigest()
+        blob = gzip.compress(body)
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO raw_payloads (
+                    provider, source_type, user_id, endpoint, request_params,
+                    window_start, window_end, http_status, content_encoding,
+                    payload_sha256, payload_bytes, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'gzip', ?, ?, ?)
+                """,
+                (
+                    provider,
+                    source_type,
+                    user_id,
+                    endpoint,
+                    json.dumps(request_params or {}, sort_keys=True),
+                    window_start,
+                    window_end,
+                    http_status,
+                    digest,
+                    len(body),
+                    blob,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def read_raw_payloads(
+        self,
+        source_type: str | None = None,
+        user_id: str | None = None,
+        endpoint: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Replay archived payloads, newest fetch first, with JSON decoded.
+
+        This is the entry point for re-deriving metrics the typed tables do not
+        carry: iterate the raw responses and map them however you like.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("source_type", source_type),
+            ("user_id", user_id),
+            ("endpoint", endpoint),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if start_date is not None:
+            clauses.append("(window_end IS NULL OR window_end >= ?)")
+            params.append(start_date)
+        if end_date is not None:
+            clauses.append("(window_start IS NULL OR window_start <= ?)")
+            params.append(end_date)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM raw_payloads {where} ORDER BY fetched_at DESC, id DESC",
+                tuple(params),
+            ).fetchall()
+
+        for row in rows:
+            record = dict(row)
+            record["payload"] = json.loads(gzip.decompress(row["payload"]).decode("utf-8"))
+            record["request_params"] = json.loads(row["request_params"])
+            yield record
+
+    def raw_payload_stats(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Summarize the raw archive by endpoint."""
+        predicate = "WHERE user_id = ?" if user_id else ""
+        params = (user_id,) if user_id else ()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT endpoint,
+                       COUNT(*) AS payloads,
+                       SUM(payload_bytes) AS uncompressed_bytes,
+                       SUM(LENGTH(payload)) AS stored_bytes,
+                       MIN(window_start) AS first_window,
+                       MAX(window_end) AS last_window,
+                       MAX(fetched_at) AS last_fetched_at
+                FROM raw_payloads {predicate}
+                GROUP BY endpoint
+                ORDER BY endpoint
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_sync_state(
         self,
