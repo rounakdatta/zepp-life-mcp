@@ -55,9 +55,13 @@ sync:
   timeZone: ""
   # Empty means every type the adapter offers, which includes workout_details.
   dataTypes: []
-  # The full-history floor. Windowing makes a wide range safe, and everything
-  # already archived is skipped, so this stays cheap after the first run.
-  startDate: "2020-01-01"
+  # Leave EMPTY. The sync service already resumes from its stored cursor, and
+  # falls back to 2020-01-01 on a cloud source that has no cursor yet -- so an
+  # empty value gives a full backfill on the first run and an incremental pass
+  # after it. Setting a date here overrides the cursor and re-fetches the entire
+  # history on every run, which on a multi-year archive means re-processing
+  # hundreds of thousands of heart-rate samples nightly for nothing.
+  startDate: ""
   # Forbid: two syncs must never write this SQLite file at once.
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3

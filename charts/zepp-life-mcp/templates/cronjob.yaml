@@ -48,7 +48,9 @@ spec:
                 {{- toYaml .Values.securityContext | nindent 16 }}
               args:
                 - sync
+                {{- if .Values.sync.startDate }}
                 - --start-date={{ .Values.sync.startDate }}
+                {{- end }}
                 {{- range .Values.sync.dataTypes }}
                 - --type={{ . }}
                 {{- end }}

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.3
+
+### Fixed
+
+- The sync CronJob no longer passes `--start-date` unless `sync.startDate` is
+  set, and the default is now empty. Passing it unconditionally overrode the
+  stored sync cursor, so every scheduled run re-fetched the whole history and
+  re-upserted every heart-rate sample instead of doing an incremental pass.
+
 ## 0.3.2
 
 ### Fixed
