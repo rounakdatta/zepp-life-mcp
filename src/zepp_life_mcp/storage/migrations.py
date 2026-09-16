@@ -328,6 +328,22 @@ def _add_raw_payloads(conn: sqlite3.Connection) -> None:
         ON raw_payloads(fetched_at)
     """)
 
+def _add_raw_payload_record_ids(conn: sqlite3.Connection) -> None:
+    """Identify payloads that are fetched one per record, not one per window.
+
+    Workout tracks come from run/detail.json keyed by trackid, so "have I
+    already archived this one?" has to be answerable without decompressing
+    every stored blob. Window columns cannot express that: two workouts on the
+    same day share a date.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(raw_payloads)")}
+    if "record_id" not in columns:
+        conn.execute("ALTER TABLE raw_payloads ADD COLUMN record_id TEXT")
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_raw_payloads_record
+        ON raw_payloads(endpoint, user_id, record_id)
+    """)
+
 
 MIGRATIONS = (
     Migration(version=1, apply=_create_baseline_schema),
@@ -337,6 +353,7 @@ MIGRATIONS = (
     Migration(version=5, apply=_add_sleep_metrics),
     Migration(version=6, apply=_scope_cloud_record_ids),
     Migration(version=7, apply=_add_raw_payloads),
+    Migration(version=8, apply=_add_raw_payload_record_ids),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

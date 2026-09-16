@@ -222,7 +222,14 @@ def main():
     sync_parser = subparsers.add_parser("sync", help="Sync data from source")
     sync_parser.add_argument(
         "--type",
-        choices=["daily_activity", "sleep", "workouts", "body_measurements", "heart_rate"],
+        choices=[
+            "daily_activity",
+            "sleep",
+            "heart_rate",
+            "workouts",
+            "workout_details",
+            "body_measurements",
+        ],
         help="Type of data to sync",
     )
     sync_parser.add_argument("--start-date", help="Start date (YYYY-MM-DD)")

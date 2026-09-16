@@ -278,6 +278,7 @@ class Database:
         window_start: str | None = None,
         window_end: str | None = None,
         http_status: int | None = None,
+        record_id: str | None = None,
         provider: str = "zepp_life",
     ) -> bool:
         """Archive one upstream response verbatim, gzipped.
@@ -296,9 +297,9 @@ class Database:
                 """
                 INSERT OR IGNORE INTO raw_payloads (
                     provider, source_type, user_id, endpoint, request_params,
-                    window_start, window_end, http_status, content_encoding,
+                    window_start, window_end, http_status, record_id, content_encoding,
                     payload_sha256, payload_bytes, payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'gzip', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'gzip', ?, ?, ?)
                 """,
                 (
                     provider,
@@ -309,6 +310,7 @@ class Database:
                     window_start,
                     window_end,
                     http_status,
+                    record_id,
                     digest,
                     len(body),
                     blob,
@@ -316,6 +318,20 @@ class Database:
             )
             conn.commit()
             return cursor.rowcount > 0
+
+    def archived_record_ids(self, endpoint: str, user_id: str) -> set[str]:
+        """Record IDs already archived for a per-record endpoint.
+
+        Lets an incremental backfill skip what it has, so the expensive first
+        pass over a full workout history happens exactly once.
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT record_id FROM raw_payloads "
+                "WHERE endpoint = ? AND user_id = ? AND record_id IS NOT NULL",
+                (endpoint, user_id),
+            ).fetchall()
+        return {str(row["record_id"]) for row in rows}
 
     def read_raw_payloads(
         self,

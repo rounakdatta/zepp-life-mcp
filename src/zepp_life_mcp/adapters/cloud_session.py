@@ -3,7 +3,7 @@
 import base64
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Container
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -50,6 +50,20 @@ BAND_DATA_ROW_CAP = 500
 # back at the cap, so the starting value only affects request count, not coverage.
 BAND_DATA_WINDOW_DAYS = 400
 
+# What a connected cloud session can sync, in a fixed order. This is a capability
+# list, not a data-presence list: whether a type has rows is a question for sync,
+# not for connect. It used to be probed and returned via list(set(...)), which was
+# both nondeterministic and able to drop a type from a default sync because one
+# probe happened to fail.
+CLOUD_DATA_TYPES = (
+    "daily_activity",
+    "sleep",
+    "heart_rate",
+    "workouts",
+    "workout_details",
+    "body_measurements",
+)
+
 RawSink = Callable[..., Any]
 
 
@@ -90,6 +104,7 @@ class CloudSessionAdapter(DataAdapter):
         window_start: str | None = None,
         window_end: str | None = None,
         http_status: int | None = None,
+        record_id: str | None = None,
     ) -> None:
         if self._raw_sink is None:
             return
@@ -103,6 +118,7 @@ class CloudSessionAdapter(DataAdapter):
                 window_start=window_start,
                 window_end=window_end,
                 http_status=http_status,
+                record_id=record_id,
             )
         except Exception as exc:
             # The mapped record still lands; surface loudly so a silently empty
@@ -250,6 +266,103 @@ class CloudSessionAdapter(DataAdapter):
             for row in rows:
                 if isinstance(row, dict):
                     yield row
+
+    def _workout_local_date(self, item: dict[str, Any]) -> str | None:
+        start_time = item.get("start_time")
+        end_time = item.get("end_time")
+        run_time = item.get("run_time", 0)
+        end_ts = int(float(end_time)) if end_time else None
+        duration_sec = int(float(run_time)) if run_time else 0
+        start_ts = (
+            int(float(start_time)) if start_time else (end_ts - duration_sec if end_ts else None)
+        )
+        if not start_ts:
+            return None
+        return self._local_date(self._utc_from_timestamp(start_ts))
+
+    async def iter_workout_details(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        skip_ids: Container[str] = frozenset(),
+    ) -> AsyncIterator[tuple[str, bool]]:
+        """Archive one run/detail.json per workout.
+
+        This is the single largest source of device data -- GPS track, per-second
+        heart rate, pace, speed, altitude, gait -- and the only one with no typed
+        table, so the raw payload *is* the record. Roughly 1.9 MB per workout
+        uncompressed, which is why it skips whatever is already archived and
+        re-fetches nothing.
+
+        Yields (trackid, newly_archived) so a pass can report what it skipped.
+        """
+        client = self._client
+        if client is None or not self.is_connected():
+            return
+
+        try:
+            params = {"limit": 100}
+            response = await client.get("/v1/sport/run/history.json", params=params)
+            if response.status_code != 200:
+                raise AdapterFetchError(
+                    f"Failed to fetch workout history: HTTP {response.status_code}"
+                )
+            history = response.json()
+            self._archive(
+                "sport.run.history",
+                params,
+                history,
+                window_start=start_date,
+                window_end=end_date,
+                http_status=response.status_code,
+            )
+
+            for item in history.get("data", {}).get("summary", []):
+                trackid = str(item.get("trackid") or "")
+                if not trackid:
+                    continue
+
+                workout_date = self._workout_local_date(item)
+                if workout_date:
+                    if start_date and workout_date < start_date:
+                        continue
+                    if end_date and workout_date > end_date:
+                        continue
+
+                if trackid in skip_ids:
+                    yield trackid, False
+                    continue
+
+                detail_params = {
+                    "trackid": trackid,
+                    "source": item.get("source") or "run.mifit.huami.com",
+                }
+                detail = await client.get("/v1/sport/run/detail.json", params=detail_params)
+                if detail.status_code != 200:
+                    # One unavailable track must not abandon the rest of the backfill.
+                    logger.warning(
+                        "run/detail.json for trackid %s returned HTTP %s; skipping",
+                        trackid,
+                        detail.status_code,
+                    )
+                    continue
+
+                self._archive(
+                    "sport.run.detail",
+                    detail_params,
+                    detail.json(),
+                    window_start=workout_date,
+                    window_end=workout_date,
+                    http_status=detail.status_code,
+                    record_id=trackid,
+                )
+                yield trackid, True
+
+        except AdapterFetchError:
+            raise
+        except Exception as exc:
+            logger.error(f"Error fetching workout details: {exc}")
+            raise AdapterFetchError("Failed to fetch workout details") from exc
 
     def _utc_from_timestamp(self, value: int | float) -> datetime:
         return datetime.fromtimestamp(value, UTC)
@@ -410,74 +523,15 @@ class CloudSessionAdapter(DataAdapter):
         return None
 
     async def _discover_data_types(self) -> list[str]:
-        types = []
-        client = self._client
-        if client is None:
-            return types
-        today = datetime.now(self._timezone).date()
-        start_date = (today - timedelta(days=30)).isoformat()
+        """What this connected session can sync, deterministically.
 
-        try:
-            response = await client.get(
-                "/v1/data/band_data.json",
-                params={
-                    "query_type": "summary",
-                    "device_type": "android_phone",
-                    "userid": self.user_id,
-                    "from_date": start_date,
-                    "to_date": today.isoformat(),
-                },
-            )
-            if response.status_code == 200:
-                data = response.json()
-                parsed = self._parse_band_data(data)
-                for _, day_data in self._iter_band_summary_entries(parsed):
-                    if day_data.get("stp"):
-                        types.append("daily_activity")
-                    if day_data.get("slp"):
-                        types.append("sleep")
-                    break
-        except Exception as exc:
-            logger.warning(f"Capability discovery failed for band summary: {exc}")
-
-        try:
-            response = await client.get(
-                "/v1/sport/run/history.json",
-                params={"limit": 1},
-            )
-            if response.status_code == 200:
-                types.append("workouts")
-        except Exception as exc:
-            logger.warning(f"Capability discovery failed for workouts: {exc}")
-
-        try:
-            response = await client.get(
-                "/v1/data/band_data.json",
-                params={
-                    "query_type": "detail",
-                    "device_type": "android_phone",
-                    "userid": self.user_id,
-                    "from_date": start_date,
-                    "to_date": today.isoformat(),
-                },
-            )
-            if response.status_code == 200:
-                for item in response.json().get("data", []):
-                    if self._parse_heart_rate_data(item.get("data_hr", "")):
-                        types.append("heart_rate")
-                        break
-        except Exception as exc:
-            logger.warning(f"Capability discovery failed for heart rate: {exc}")
-
-        try:
-            url = f"{self.ZEPP_WEIGHT_API}/users/{self.user_id}/members/-1/weightRecords?limit=1"
-            response = await client.get(url)
-            if response.status_code == 200:
-                types.append("body_measurements")
-        except Exception as exc:
-            logger.warning(f"Capability discovery failed for body measurements: {exc}")
-
-        return list(set(types))
+        Previously this probed four endpoints and returned list(set(...)), so the
+        order changed between runs and a single failed or momentarily-empty probe
+        silently removed a type from the default sync set -- meaning the archive
+        could quietly stop covering something it had covered yesterday. Presence
+        of data is determined at sync time, where an empty result is visible.
+        """
+        return list(CLOUD_DATA_TYPES)
 
     async def iter_daily_activity(
         self,

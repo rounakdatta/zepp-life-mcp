@@ -195,3 +195,114 @@ async def test_identical_refetch_dedupes_but_changed_content_is_versioned(tmp_pa
         "daily_activity", start_date="2026-01-01", end_date="2026-01-31", force_full=True
     )
     assert db.raw_payload_stats(user_id="u1")[0]["payloads"] == 2
+
+
+class WorkoutDetailClient:
+    """Fake run/history.json + run/detail.json pair."""
+
+    def __init__(self, trackids: list[str], failing: set[str] | None = None):
+        self.trackids = trackids
+        self.failing = failing or set()
+        self.detail_calls: list[str] = []
+
+    async def get(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any):
+        params = params or {}
+        if "history" in url:
+            return FakeResponse(
+                {
+                    "data": {
+                        "summary": [
+                            {
+                                "trackid": t,
+                                "source": "run.mifit.huami.com",
+                                "end_time": str(1_700_000_000 + i * 86400),
+                                "run_time": "3600",
+                                "type": "1",
+                                "dis": "10000",
+                            }
+                            for i, t in enumerate(self.trackids)
+                        ]
+                    }
+                }
+            )
+        trackid = params["trackid"]
+        self.detail_calls.append(trackid)
+        if trackid in self.failing:
+            response = FakeResponse({"error": "gone"})
+            response.status_code = 404
+            return response
+        return FakeResponse({"data": {"trackid": trackid, "longitude_latitude": "1,2;3,4"}})
+
+
+async def test_workout_details_are_archived_once_then_skipped(tmp_path):
+    """The expensive pass must be a one-time backfill, not a per-sync refetch."""
+    db = Database(tmp_path / "details.db")
+    client = WorkoutDetailClient(["t1", "t2", "t3"])
+    adapter = _adapter(client)
+    service = SyncService(adapter, db)
+
+    first = await service.sync_data_type("workout_details", start_date="2000-01-01")
+    assert (first["added"], first["skipped"]) == (3, 0)
+    assert client.detail_calls == ["t1", "t2", "t3"]
+
+    second = await service.sync_data_type("workout_details", start_date="2000-01-01")
+    assert (second["added"], second["skipped"]) == (0, 3)
+    assert client.detail_calls == ["t1", "t2", "t3"], "must not refetch what it has"
+
+    # a new workout appears -> only that one is fetched
+    client.trackids.append("t4")
+    third = await service.sync_data_type("workout_details", start_date="2000-01-01")
+    assert (third["added"], third["skipped"]) == (1, 3)
+    assert client.detail_calls[-1] == "t4"
+
+    assert db.archived_record_ids("sport.run.detail", "u1") == {"t1", "t2", "t3", "t4"}
+    payloads = list(db.read_raw_payloads(endpoint="sport.run.detail"))
+    assert {p["record_id"] for p in payloads} == {"t1", "t2", "t3", "t4"}
+    assert payloads[0]["payload"]["data"]["longitude_latitude"] == "1,2;3,4"
+
+
+async def test_one_unavailable_track_does_not_abandon_the_backfill(tmp_path):
+    db = Database(tmp_path / "partial.db")
+    client = WorkoutDetailClient(["t1", "t2", "t3"], failing={"t2"})
+    service = SyncService(_adapter(client), db)
+
+    result = await service.sync_data_type("workout_details", start_date="2000-01-01")
+
+    assert result["added"] == 2
+    assert db.archived_record_ids("sport.run.detail", "u1") == {"t1", "t3"}
+
+
+async def test_default_sync_types_are_deterministic_and_include_details():
+    adapter = CloudSessionAdapter(app_token="t", user_id="u1")
+    adapter._connected = True
+    adapter._available_types = list(cloud_session.CLOUD_DATA_TYPES)
+
+    types = adapter.get_available_data_types()
+    assert types == [
+        "daily_activity",
+        "sleep",
+        "heart_rate",
+        "workouts",
+        "workout_details",
+        "body_measurements",
+    ]
+    assert types == adapter.get_available_data_types(), "must not vary between calls"
+
+
+async def test_export_mode_skips_workout_details_instead_of_failing(tmp_path):
+    """A default sync lists every type; a source that cannot serve one must no-op."""
+
+    class NoDetailAdapter:
+        source_type = "export_file"
+
+        def is_connected(self):
+            return True
+
+        def get_user_id(self):
+            return "u1"
+
+    db = Database(tmp_path / "export.db")
+    result = await SyncService(cast(Any, NoDetailAdapter()), db).sync_data_type(
+        "workout_details", start_date="2024-01-01", end_date="2024-12-31"
+    )
+    assert result["added"] == 0
