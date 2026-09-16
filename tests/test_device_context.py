@@ -218,3 +218,69 @@ async def test_unrecognised_workout_zone_does_not_break_the_sync():
     assert got[0].timezone == "Asia/Kolkata"
     assert got[0].tz_offset_seconds is None
     assert got[0].city == "Elysium", "a bad zone must not discard the rest of the place"
+
+
+def _hr_db(tmp_path, n_passive=500):
+    """A database with enough passive samples to matter."""
+    from datetime import timedelta
+
+    from zepp_life_mcp.models import HeartRateSample
+
+    db = Database(tmp_path / "hr.db")
+    base = datetime(2026, 7, 1, tzinfo=UTC)
+    for i in range(n_passive):
+        ts = base + timedelta(minutes=i)
+        db.upsert_heart_rate_sample(
+            HeartRateSample(
+                id=f"p{i}", provider="zepp_life", source_type="cloud_session", user_id="u1",
+                timestamp=ts, local_date=ts.date().isoformat(), bpm=70, sample_type="passive",
+            )
+        )
+    db.upsert_heart_rate_sample(
+        HeartRateSample(
+            id="r1", provider="zepp_life", source_type="cloud_session", user_id="u1",
+            timestamp=base, local_date=base.date().isoformat(), bpm=48, sample_type="resting",
+        )
+    )
+    return db
+
+
+def test_heart_rate_filter_and_bound_happen_in_sql(tmp_path):
+    """Regression: this query read every row before filtering, and OOM-killed the pod.
+
+    Passive heart rate is one sample a minute, so a wide range is hundreds of
+    thousands of rows. Selecting them all and filtering in Python materialises
+    every one as a dict before the caller's limit applies -- a container with a
+    memory limit simply dies, which is what happened in production.
+    """
+    db = _hr_db(tmp_path)
+
+    # the filter reaches the database, not a Python loop over everything
+    resting = db.query_heart_rate_samples("u1", "2026-07-01", "2026-07-31",
+                                          sample_type="resting")
+    assert len(resting) == 1
+    assert resting[0]["bpm"] == 48
+
+    # and the bound does too
+    bounded = db.query_heart_rate_samples("u1", "2026-07-01", "2026-07-31", limit=25)
+    assert len(bounded) == 25
+
+
+def test_heart_rate_query_is_bounded_even_when_no_limit_is_asked_for(tmp_path, monkeypatch):
+    from zepp_life_mcp.services import query_service as qs
+
+    db = _hr_db(tmp_path)
+    monkeypatch.setattr(qs, "DEFAULT_HEART_RATE_LIMIT", 40)
+    samples = qs.QueryService(db, "u1").get_heart_rate_samples("2026-07-01", "2026-07-31")
+    assert len(samples) == 40, "an unbounded request must still be bounded"
+
+
+def test_an_absurd_limit_is_capped(tmp_path, monkeypatch):
+    from zepp_life_mcp.services import query_service as qs
+
+    db = _hr_db(tmp_path)
+    monkeypatch.setattr(qs, "MAX_HEART_RATE_LIMIT", 10)
+    samples = qs.QueryService(db, "u1").get_heart_rate_samples(
+        "2026-07-01", "2026-07-31", limit=10_000_000
+    )
+    assert len(samples) == 10, "one query must not be able to kill the process"

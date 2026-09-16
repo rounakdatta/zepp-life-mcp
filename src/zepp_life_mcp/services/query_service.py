@@ -9,6 +9,11 @@ from zepp_life_mcp.storage import Database
 # Sleep facts reachable through the AGGREGATED series, so a year of nights costs
 # a few hundred bytes rather than the few hundred kilobytes a full session dump
 # takes. query_sleep still returns whole sessions when the detail is wanted.
+# One passive sample per minute means ~1,440 rows a day and ~800,000 across the
+# archive. These bounds are what stop a wide query from being an outage.
+DEFAULT_HEART_RATE_LIMIT = 10_000
+MAX_HEART_RATE_LIMIT = 100_000
+
 SLEEP_METRIC_COLUMNS = {
     "sleep_minutes": "time_asleep_minutes",
     "sleep_deep_minutes": "deep_minutes",
@@ -304,12 +309,24 @@ class QueryService:
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         self._validate_date_range(start_date, end_date)
-        records = self.db.query_heart_rate_samples(self.user_id, start_date, end_date)
+        # Bounded by default: passive heart rate is a sample a minute, so an
+        # unbounded range is hundreds of thousands of rows and the caller almost
+        # never wants all of them. An explicit limit is still capped, because a
+        # single query must not be able to kill the process.
+        effective_limit = min(
+            int(limit) if limit is not None else DEFAULT_HEART_RATE_LIMIT,
+            MAX_HEART_RATE_LIMIT,
+        )
+        records = self.db.query_heart_rate_samples(
+            self.user_id,
+            start_date,
+            end_date,
+            sample_type=sample_type,
+            limit=effective_limit,
+        )
 
         samples = []
         for record in records:
-            if sample_type and record.get("sample_type") != sample_type:
-                continue
             samples.append(
                 {
                     "timestamp": record["timestamp"],
@@ -318,8 +335,7 @@ class QueryService:
                 }
             )
 
-        if limit is not None:
-            return samples[:limit]
+        # The bound was applied in SQL; nothing left to trim here.
         return samples
 
     def get_raw_payloads(

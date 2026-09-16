@@ -601,17 +601,33 @@ class Database:
         user_id: str,
         start_date: str,
         end_date: str,
+        sample_type: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Heart-rate samples, filtered and bounded IN SQL.
+
+        Passive heart rate is one sample per minute, so a year and a half is
+        roughly 800,000 rows. Selecting them all and filtering in Python -- which
+        is what this did -- materialises every one as a dict before the caller's
+        limit is applied, and a container with a memory limit is killed outright
+        by a single innocuous-looking query. The filter and the bound belong in
+        the query.
+        """
+        clauses = ["user_id = ?", "local_date >= ?", "local_date <= ?"]
+        params: list[Any] = [user_id, start_date, end_date]
+        if sample_type:
+            clauses.append("sample_type = ?")
+            params.append(sample_type)
+
+        sql = (
+            f"SELECT * FROM heart_rate_samples WHERE {' AND '.join(clauses)} ORDER BY timestamp"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+
         with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM heart_rate_samples
-                WHERE user_id = ?
-                AND local_date >= ? AND local_date <= ?
-                ORDER BY timestamp
-                """,
-                (user_id, start_date, end_date),
-            ).fetchall()
+            rows = conn.execute(sql, tuple(params)).fetchall()
             return [dict(row) for row in rows]
 
     def get_data_coverage(self, user_id: str) -> list[dict[str, Any]]:

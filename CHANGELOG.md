@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.2
+
+### Fixed
+
+- `query_heart_rate` could kill the server. It selected every sample in the date
+  range and then filtered by type and applied the caller's limit **in Python**,
+  so a wide range materialised hundreds of thousands of dicts before returning a
+  handful. Passive heart rate is one sample per minute -- about 800,000 rows
+  across the archive -- and a container with a memory limit is simply killed.
+  Observed in production: one 18-month query took the endpoint down until the
+  pod restarted. The filter and the bound now happen in SQL, an unbounded
+  request is capped at 10,000 samples, and an explicit limit is capped at
+  100,000, so no single query can end the process.
+
 ## 0.4.1
 
 ### Added
