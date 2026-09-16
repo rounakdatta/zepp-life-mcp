@@ -29,7 +29,15 @@ The current implementation supports:
   are **not comparable across a change in this value**: a version bump can move
   time between deep, light and REM without any change in the sleep itself.
 
-Cloud coverage can vary by account, region, and upstream endpoint stability.
+Cloud coverage can vary by account and upstream endpoint stability.
+
+**Export mode has no heart rate.** Zepp's export archives carry no heart-rate
+series, so `query_heart_rate` returns nothing in `export_file` mode -- it is not
+a missing parser, there is nothing to parse. Cloud is the only source for it.
+
+`region` is accepted by the CLI and config but does **not** select an API host
+and never has; Zepp's regional hostnames are not reliably derivable from it. Set
+`ZEPP_API_HOST` if you need a different endpoint.
 
 ### Raw payload archive
 

@@ -30,7 +30,9 @@ def _default_logs_path() -> Path:
 
 class Config(BaseModel):
     mode: Literal["export_file", "cloud_session", "not_configured"] = "not_configured"
+    # Accepted for compatibility; it does not select an API host. Use api_host.
     region: str = "eu"
+    api_host: str | None = None
     timezone: str = Field(default="UTC")
     database_path: Path = Field(default_factory=_default_database_path)
     logs_path: Path = Field(
@@ -84,6 +86,7 @@ def get_config_path() -> Path:
 ENV_OVERRIDES = {
     "ZEPP_MODE": "mode",
     "ZEPP_REGION": "region",
+    "ZEPP_API_HOST": "api_host",
     "ZEPP_TIMEZONE": "timezone",
     "ZEPP_DATABASE_PATH": "database_path",
     "ZEPP_EXPORT_PATH": "export_path",

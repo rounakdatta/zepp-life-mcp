@@ -386,6 +386,21 @@ def _add_workout_place(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE workouts ADD COLUMN {column} TEXT")
 
 
+def _add_workout_effort(conn: sqlite3.Connection) -> None:
+    """Fitness markers the upstream record carries and the schema had nowhere for.
+
+    VO2max and training effect are on most workouts and are the two numbers a
+    person actually tracks over a season. Note that VO2max is the DEVICE'S
+    ESTIMATE and can step when its firmware recalibrates -- treat a jump as a
+    measurement change until performance corroborates it.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(workouts)")}
+    if "vo2max" not in columns:
+        conn.execute("ALTER TABLE workouts ADD COLUMN vo2max REAL")
+    if "training_effect" not in columns:
+        conn.execute("ALTER TABLE workouts ADD COLUMN training_effect REAL")
+
+
 MIGRATIONS = (
     Migration(version=1, apply=_create_baseline_schema),
     Migration(version=2, apply=_add_device_keys, destructive=True),
@@ -397,6 +412,7 @@ MIGRATIONS = (
     Migration(version=8, apply=_add_raw_payload_record_ids),
     Migration(version=9, apply=_add_device_context),
     Migration(version=10, apply=_add_workout_place),
+    Migration(version=11, apply=_add_workout_effort),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

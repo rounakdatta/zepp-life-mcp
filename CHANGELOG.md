@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0
+
+Clears the backlog of things flagged in review and never actually fixed.
+
+### Fixed
+
+- **Workout pace and step count were hardcoded `None`** while the columns existed
+  and the values sat in the same response that was already being parsed. 387 of
+  425 workouts had pace data and all of it was discarded. Upstream reports pace
+  in seconds per *metre*; the conversion is verified against distance over
+  duration on real runs. Upstream's `max_pace` is the **fastest** pace, so it is
+  numerically smaller than the average -- documented on the field, because the
+  name invites the opposite assumption.
+- **`get_profile` returned `devices: []` behind a `# TODO`** while the devices
+  endpoint answered fine. It now lists the bound devices with their firmware;
+  a failure there is logged and leaves the rest of the profile intact.
+- **`region` never selected an API host.** It is still accepted, and now says so
+  in the code and the README rather than looking functional. `api_host` /
+  `ZEPP_API_HOST` is the real knob -- Zepp's regional hostnames are not reliably
+  derivable from a region string, and guessing one would break a working account.
+- **Export mode's empty heart rate is documented as final**, not as a stub
+  awaiting a parser: Zepp's export archives contain no heart-rate series, so
+  cloud is the only source. The README no longer implies export mode is the more
+  complete of the two.
+
+### Added
+
+- `vo2max` and `training_effect` columns on workouts, present on 120 and 388 of
+  425 records respectively. VO2max is the device's **estimate** and can step when
+  firmware recalibrates, which is noted on the field.
+- Values upstream writes as `0` or `-1` for "not recorded" are stored as absent
+  rather than as zero, so they cannot quietly drag an average down.
+
 ## 0.4.2
 
 ### Fixed

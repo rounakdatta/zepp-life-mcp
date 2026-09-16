@@ -284,3 +284,79 @@ def test_an_absurd_limit_is_capped(tmp_path, monkeypatch):
         "2026-07-01", "2026-07-31", limit=10_000_000
     )
     assert len(samples) == 10, "one query must not be able to kill the process"
+
+
+class DeviceClient:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+
+    async def get(self, url, params=None, **kwargs):
+        r = FakeResponse(self.payload)
+        r.status_code = self.status
+        return r
+
+
+async def test_get_profile_lists_real_devices():
+    """It reported `devices: []` behind a TODO while the endpoint answered fine."""
+    adapter = CloudSessionAdapter(app_token="t", user_id="u1")
+    cast(Any, adapter)._client = DeviceClient({"items": [{
+        "deviceId": "D8803CFFFEC173D4", "deviceType": 0, "deviceSource": 8716547,
+        "macAddress": "D8:80:3C:C1:73:D4", "firmwareVersion": "6.3.25.7"}]})
+    adapter._connected = True
+
+    devices = await adapter.get_devices()
+    assert len(devices) == 1
+    assert devices[0]["device_id"] == "D8803CFFFEC173D4"
+    assert devices[0]["firmware_version"] == "6.3.25.7"
+
+
+async def test_device_listing_failure_is_not_fatal():
+    """A profile without a device list is still a useful profile."""
+    adapter = CloudSessionAdapter(app_token="t", user_id="u1")
+    cast(Any, adapter)._client = DeviceClient({}, status=500)
+    adapter._connected = True
+    assert await adapter.get_devices() == []
+
+
+async def test_workout_pace_and_effort_reach_the_model():
+    """Regression: pace, steps, VO2max and training effect were all discarded.
+
+    Upstream reports pace in seconds per METRE. Verified against real runs:
+    avg_pace 0.3831 over 10.02 km in 64 min is 383 s/km, i.e. 6:23/km.
+    """
+    items = [workout_item(avg_pace="0.3831159", max_pace="0.246",
+                          total_step="9629", VO2_max="54", te="45")]
+    w = [x async for x in _workout_adapter(items).iter_workouts()][0]
+    assert round(w.avg_pace_sec_per_km) == 383
+    assert round(w.max_pace_sec_per_km) == 246, "upstream 'max' pace is the FASTEST"
+    assert w.total_steps == 9629
+    assert w.vo2max == 54
+    assert w.training_effect == 45
+
+
+async def test_unrecorded_effort_fields_are_absent_not_zero():
+    """Upstream writes 0 and -1 for 'not recorded'; storing those poisons averages."""
+    items = [workout_item(avg_pace="0", max_pace="-1", total_step="0", VO2_max="", te=None)]
+    w = [x async for x in _workout_adapter(items).iter_workouts()][0]
+    assert w.avg_pace_sec_per_km is None
+    assert w.max_pace_sec_per_km is None
+    assert w.total_steps is None
+    assert w.vo2max is None
+    assert w.training_effect is None
+
+
+def test_api_host_is_the_real_knob_and_region_is_not():
+    """`region` never selected a host; pretending it did would break working setups."""
+    default = CloudSessionAdapter(app_token="t", user_id="u1", region="eu")
+    assert default.api_host == CloudSessionAdapter.ZEPP_API_BASE
+
+    # changing region alone changes nothing about where requests go
+    other = CloudSessionAdapter(app_token="t", user_id="u1", region="us")
+    assert other.api_host == default.api_host
+
+    # api_host does
+    override = CloudSessionAdapter(
+        app_token="t", user_id="u1", api_host="https://api-mifit-de2.huami.com"
+    )
+    assert override.api_host == "https://api-mifit-de2.huami.com"

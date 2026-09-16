@@ -85,12 +85,28 @@ class Workout(BaseEntity):
     calories_kcal: float | None = Field(None, ge=0, description="Calories burned")
     avg_heart_rate_bpm: int | None = Field(None, ge=0, description="Average heart rate")
     max_heart_rate_bpm: int | None = Field(None, ge=0, description="Maximum heart rate")
-    avg_pace_sec_per_km: float | None = Field(None, ge=0, description="Average pace")
-    max_pace_sec_per_km: float | None = Field(None, ge=0, description="Maximum pace")
+    avg_pace_sec_per_km: float | None = Field(None, ge=0, description="Average pace, seconds per km")
+    max_pace_sec_per_km: float | None = Field(
+        None,
+        ge=0,
+        description=(
+            "Best pace, seconds per km. Upstream reports the FASTEST pace here, so this "
+            "is numerically the smallest of the two, not the largest."
+        ),
+    )
     total_steps: int | None = Field(None, ge=0, description="Steps during workout")
     tz_offset_seconds: int | None = Field(
         None, description="Device UTC offset that day, in seconds"
     )
+    vo2max: float | None = Field(
+        None,
+        ge=0,
+        description=(
+            "Device VO2max ESTIMATE. It can step when the firmware recalibrates, so a jump "
+            "is a measurement change until performance corroborates it."
+        ),
+    )
+    training_effect: float | None = Field(None, ge=0, description="Device training-effect score")
     city: str | None = Field(None, description="City the device reported for this workout")
     geohash: str | None = Field(None, description="Geohash the device reported for this workout")
 

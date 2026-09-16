@@ -173,7 +173,9 @@ async def cmd_sync_async(args):
             print("❌ Токен не найден")
             print(f"   Запустите: {PROGRAM_NAME} setup")
             sys.exit(1)
-        adapter = CloudSessionAdapter(token, user_id, config.region, config.timezone)
+        adapter = CloudSessionAdapter(
+            token, user_id, config.region, config.timezone, api_host=config.api_host
+        )
         if not await adapter.connect():
             print("❌ Не удалось подключиться к API")
             sys.exit(1)

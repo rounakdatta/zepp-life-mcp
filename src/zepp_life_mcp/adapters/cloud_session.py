@@ -67,6 +67,27 @@ CLOUD_DATA_TYPES = (
 RawSink = Callable[..., Any]
 
 
+def _scaled(value: Any, factor: float) -> float | None:
+    """A positive numeric field, scaled; anything else is absent rather than zero.
+
+    Upstream uses 0 and -1 interchangeably for "not recorded", and storing those
+    as real measurements would quietly poison any average taken over them.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number * factor if number > 0 else None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
 class CloudSessionAdapter(DataAdapter):
     """Adapter for accessing Zepp Life cloud APIs."""
 
@@ -81,10 +102,17 @@ class CloudSessionAdapter(DataAdapter):
         user_id: str | None = None,
         region: str = "eu",
         timezone: str = "UTC",
+        api_host: str | None = None,
     ):
         self.app_token = app_token
         self.user_id = user_id
+        # `region` does NOT select a host and never has -- it is kept because the
+        # CLI and config have always accepted it. Zepp's regional hostnames are
+        # not reliably derivable from it, so guessing one would break a working
+        # account for no gain. `api_host` is the real knob for anyone who needs a
+        # different endpoint.
         self.region = region
+        self.api_host = api_host or self.ZEPP_API_BASE
         self.timezone = timezone
         self._timezone = ZoneInfo(timezone)
         self._connected = False
@@ -307,6 +335,49 @@ class CloudSessionAdapter(DataAdapter):
             return None
         return self._local_date(self._utc_from_timestamp(start_ts))
 
+    async def get_devices(self) -> list[dict[str, Any]]:
+        """The bands and scales bound to this account.
+
+        get_profile has reported `devices: []` behind a TODO since the first
+        release even though this endpoint answers fine. Failure is non-fatal:
+        a profile without a device list is still a useful profile.
+        """
+        client = self._client
+        if client is None or not self.is_connected():
+            return []
+        try:
+            response = await client.get(
+                f"/users/{self.user_id}/devices", params={"deviceType": "all"}
+            )
+            if response.status_code != 200:
+                logger.warning("Device listing returned HTTP %s", response.status_code)
+                return []
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("Could not list devices: %s", exc)
+            return []
+
+        self._archive(
+            "users.devices",
+            {"deviceType": "all"},
+            payload,
+            http_status=200,
+        )
+        devices = []
+        for item in payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            devices.append(
+                {
+                    "device_id": str(item.get("deviceId") or "") or None,
+                    "device_type": str(item.get("deviceType") or "") or None,
+                    "device_source": str(item.get("deviceSource") or "") or None,
+                    "mac_address": str(item.get("macAddress") or "") or None,
+                    "firmware_version": str(item.get("firmwareVersion") or "") or None,
+                }
+            )
+        return devices
+
     async def iter_workout_details(
         self,
         start_date: str | None = None,
@@ -406,8 +477,9 @@ class CloudSessionAdapter(DataAdapter):
             logger.error("No app_token provided")
             return False
 
+        logger.info("Using Zepp API host %s", self.api_host)
         self._client = httpx.AsyncClient(
-            base_url=self.ZEPP_API_BASE,
+            base_url=self.api_host,
             headers={
                 "apptoken": self.app_token,
                 "appPlatform": "web",
@@ -834,10 +906,15 @@ class CloudSessionAdapter(DataAdapter):
                     max_heart_rate_bpm=int(float(item.get("max_heart_rate")))
                     if item.get("max_heart_rate")
                     else None,
-                    avg_pace_sec_per_km=None,
-                    max_pace_sec_per_km=None,
-                    total_steps=None,
+                    # Upstream reports pace in seconds per METRE; the column is
+                    # seconds per kilometre. Verified against distance/duration on
+                    # real runs: avg_pace 0.3831 -> 383 s/km -> 6:23/km.
+                    avg_pace_sec_per_km=_scaled(item.get("avg_pace"), 1000),
+                    max_pace_sec_per_km=_scaled(item.get("max_pace"), 1000),
+                    total_steps=_positive_int(item.get("total_step")),
                     tz_offset_seconds=offset_seconds,
+                    vo2max=_scaled(item.get("VO2_max"), 1),
+                    training_effect=_scaled(item.get("te"), 1),
                     city=str(item.get("city") or "").strip() or None,
                     geohash=str(item.get("location") or "").strip() or None,
                 )

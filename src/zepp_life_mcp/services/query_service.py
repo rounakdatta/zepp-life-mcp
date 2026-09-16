@@ -249,6 +249,8 @@ class QueryService:
                     "local_date": record.get("local_date"),
                     "timezone": record.get("timezone"),
                     "tz_offset_seconds": record.get("tz_offset_seconds"),
+                    "vo2max": record.get("vo2max"),
+                    "training_effect": record.get("training_effect"),
                     "city": record.get("city"),
                     "geohash": record.get("geohash"),
                 }

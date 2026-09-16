@@ -564,8 +564,12 @@ async def _handle_get_profile(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
     if arguments.get("include_devices"):
-        # TODO: Get devices from adapter
-        pass
+        get_devices = getattr(context.adapter, "get_devices", None)
+        if callable(get_devices):
+            result = get_devices()
+            if inspect.isawaitable(result):
+                result = await result
+            profile["devices"] = result or []
 
     return QueryResponse(
         status="ok",
@@ -907,6 +911,7 @@ async def _configure_runtime() -> None:
                 user_id,
                 context.config.region,
                 context.config.timezone,
+                api_host=context.config.api_host,
             )
     if context.adapter and context.adapter.is_connected():
         context.sync_service = SyncService(

@@ -805,6 +805,13 @@ class ExportFileAdapter(DataAdapter):
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> Iterator[HeartRateSample]:
+        """Always empty: Zepp's export archives carry no heart-rate series.
+
+        Not a stub awaiting a parser -- there is nothing in the export to parse.
+        Heart rate is available only from the cloud source, so an export-only
+        setup has no heart-rate history at all. Said plainly here because the
+        README once implied export mode was the more complete of the two.
+        """
         return iter(())
 
     def _normalize_date(self, date_str: str) -> str:
