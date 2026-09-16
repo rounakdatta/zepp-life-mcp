@@ -899,9 +899,11 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
             finally:
                 await close_runtime_context()
 
-    http_app = Starlette(
-        routes=[Route("/healthz", healthz, methods=["GET"]), Mount("/mcp", app=handle_mcp)],
-        lifespan=lifespan,
+    http_app: Any = McpPathNormalizer(
+        Starlette(
+            routes=[Route("/healthz", healthz, methods=["GET"]), Mount("/mcp", app=handle_mcp)],
+            lifespan=lifespan,
+        )
     )
 
     if not auth_token:
@@ -910,6 +912,29 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
         )
         return http_app
     return BearerAuthMiddleware(http_app, auth_token, exempt_paths=frozenset({"/healthz"}))
+
+
+class McpPathNormalizer:
+    """Serve /mcp and /mcp/ identically.
+
+    Starlette's Mount answers the un-slashed form with a 307 to the slashed one.
+    Redirect handling on POST is not universal across HTTP clients, and the
+    endpoint URL is something a person types into a client config by hand, so
+    both spellings have to work rather than one of them working by luck.
+    """
+
+    def __init__(self, app, mount_path: str = "/mcp"):
+        self.app = app
+        self.mount_path = mount_path
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == self.mount_path:
+            scope = dict(scope)
+            scope["path"] = f"{self.mount_path}/"
+            raw_path = scope.get("raw_path")
+            if raw_path:
+                scope["raw_path"] = raw_path + b"/"
+        await self.app(scope, receive, send)
 
 
 class BearerAuthMiddleware:

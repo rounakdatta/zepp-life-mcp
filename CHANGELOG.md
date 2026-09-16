@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+
+- `/mcp` answered with a 307 redirect to `/mcp/`, because Starlette's `Mount`
+  redirects the un-slashed path. Redirect-following on POST is not universal
+  across HTTP clients, and the endpoint URL is typed into a client config by
+  hand, so relying on one spelling working by luck was wrong. Both now serve
+  directly.
+
 ## 0.3.0
 
 ### Fixed

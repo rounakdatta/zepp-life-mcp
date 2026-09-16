@@ -386,3 +386,42 @@ async def test_archive_owner_is_resolved_without_a_connection(tmp_path):
         )
     )
     assert db.sole_user_id() is None, "ambiguous ownership must not be guessed"
+
+
+async def test_mcp_endpoint_answers_with_and_without_a_trailing_slash():
+    """Regression: /mcp returned 307 to /mcp/.
+
+    Starlette's Mount redirects the un-slashed path. Redirect-following on POST
+    is not universal, and the endpoint URL gets typed into a client config by
+    hand, so both spellings must work directly.
+    """
+    from zepp_life_mcp import server
+
+    seen: list[str] = []
+
+    class Recorder:
+        async def __call__(self, scope, receive, send):
+            # A lifespan scope carries no path; record only what it forwards.
+            if "path" in scope:
+                seen.append(scope["path"])
+
+    normalizer = server.McpPathNormalizer(Recorder())
+
+    for requested in ("/mcp", "/mcp/"):
+        await normalizer({"type": "http", "path": requested, "raw_path": requested.encode()}, None, None)
+    assert seen == ["/mcp/", "/mcp/"]
+
+    # unrelated paths are untouched
+    seen.clear()
+    await normalizer({"type": "http", "path": "/healthz"}, None, None)
+    assert seen == ["/healthz"]
+
+    # non-http scopes (lifespan) pass straight through, untouched
+    forwarded: list[dict] = []
+
+    class ScopeRecorder:
+        async def __call__(self, scope, receive, send):
+            forwarded.append(scope)
+
+    await server.McpPathNormalizer(ScopeRecorder())({"type": "lifespan"}, None, None)
+    assert forwarded == [{"type": "lifespan"}]
