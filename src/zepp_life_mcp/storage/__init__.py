@@ -42,12 +42,20 @@ class Database:
         """Initialize database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         run_migrations(self.db_path)
+        # A deployment runs sync in one process and serving in another against
+        # the same file. WAL lets the reader keep working through a write
+        # instead of failing on SQLITE_BUSY; it is stored in the file header, so
+        # setting it once here is enough.
+        with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
 
     @contextmanager
     def _get_connection(self):
         """Get database connection with row factory."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        # Wait out a concurrent writer rather than raising immediately.
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
         finally:
