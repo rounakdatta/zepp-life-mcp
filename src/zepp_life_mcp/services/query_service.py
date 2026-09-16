@@ -6,6 +6,18 @@ from typing import Any
 
 from zepp_life_mcp.storage import Database
 
+# Sleep facts reachable through the AGGREGATED series, so a year of nights costs
+# a few hundred bytes rather than the few hundred kilobytes a full session dump
+# takes. query_sleep still returns whole sessions when the detail is wanted.
+SLEEP_METRIC_COLUMNS = {
+    "sleep_minutes": "time_asleep_minutes",
+    "sleep_deep_minutes": "deep_minutes",
+    "sleep_rem_minutes": "rem_minutes",
+    "sleep_awake_minutes": "time_awake_minutes",
+    "sleep_wake_count": "wake_count",
+    "sleep_score": "sleep_score",
+}
+
 
 class QueryService:
     """Service for querying fitness data from local database."""
@@ -48,6 +60,7 @@ class QueryService:
                     "total_kcal": 0,
                     "floors": 0,
                     "active_minutes": 0,
+                    "tz_offset_seconds": record.get("tz_offset_seconds"),
                 }
 
             summaries[date]["steps"] += record.get("steps", 0)
@@ -72,7 +85,9 @@ class QueryService:
     ) -> list[dict[str, Any]]:
         """Get time series for a metric."""
         self._validate_date_range(start_date, end_date)
-        valid_metrics = {"steps", "distance_m", "active_kcal", "weight_kg", "sleep_minutes"}
+        valid_metrics = {"steps", "distance_m", "active_kcal", "weight_kg"} | set(
+            SLEEP_METRIC_COLUMNS
+        )
         valid_granularities = {"day", "week", "month"}
         valid_aggregations = {"sum", "avg", "min", "max", "latest"}
         if metric not in valid_metrics:
@@ -88,10 +103,11 @@ class QueryService:
                 {"date": record["local_date"], "value": record["weight_kg"]}
                 for record in records
             ]
-        elif metric == "sleep_minutes":
+        elif metric in SLEEP_METRIC_COLUMNS:
+            column = SLEEP_METRIC_COLUMNS[metric]
             records = self.db.query_sleep_sessions(self.user_id, start_date, end_date)
             series = [
-                {"date": record["local_date"], "value": record["time_asleep_minutes"]}
+                {"date": record["local_date"], "value": record[column] or 0}
                 for record in records
             ]
         else:
@@ -153,12 +169,20 @@ class QueryService:
 
             session = {
                 "sleep_id": record["sleep_id"],
+                # local_date and the offset are what make a multi-timezone series
+                # readable; both existed in the row and neither was ever returned.
+                "local_date": record.get("local_date"),
+                "timezone": record.get("timezone"),
+                "tz_offset_seconds": record.get("tz_offset_seconds"),
+                "algo_version": record.get("algo_version"),
                 "start_at": record["start_at"],
                 "end_at": record["end_at"],
                 "duration_minutes": record["duration_minutes"],
                 "time_asleep_minutes": record["time_asleep_minutes"],
                 "time_awake_minutes": record["time_awake_minutes"],
                 "rem_minutes": record.get("rem_minutes", 0),
+                "deep_minutes": record.get("deep_minutes", 0),
+                "light_minutes": record.get("light_minutes", 0),
                 "wake_count": record.get("wake_count", 0),
                 "sleep_score": record.get("sleep_score"),
                 "is_nap": record.get("is_nap", False),
@@ -217,6 +241,8 @@ class QueryService:
                     "avg_pace_sec_per_km": record.get("avg_pace_sec_per_km"),
                     "max_pace_sec_per_km": record.get("max_pace_sec_per_km"),
                     "total_steps": record.get("total_steps"),
+                    "local_date": record.get("local_date"),
+                    "tz_offset_seconds": record.get("tz_offset_seconds"),
                 }
             )
 
@@ -292,6 +318,46 @@ class QueryService:
         if limit is not None:
             return samples[:limit]
         return samples
+
+    def get_raw_payloads(
+        self,
+        endpoint: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        include_payload: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Inventory of the verbatim upstream archive, newest fetch first.
+
+        The typed tables keep a deliberate subset -- Zepp returns 193 fields per
+        workout and the schema stores a dozen. Everything else is in this
+        archive and was, until now, reachable only by opening the SQLite file.
+        Payload bodies are omitted unless asked for, because a single band_data
+        window can be several megabytes.
+        """
+        rows = []
+        for record in self.db.read_raw_payloads(
+            user_id=self.user_id,
+            endpoint=endpoint,
+            start_date=start_date,
+            end_date=end_date,
+        ):
+            row = {
+                "endpoint": record["endpoint"],
+                "window_start": record["window_start"],
+                "window_end": record["window_end"],
+                "record_id": record.get("record_id"),
+                "fetched_at": record["fetched_at"],
+                "http_status": record["http_status"],
+                "payload_bytes": record["payload_bytes"],
+                "payload_sha256": record["payload_sha256"],
+            }
+            if include_payload:
+                row["payload"] = record["payload"]
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        return rows
 
     def get_data_coverage(self, data_types: list[str] | None = None) -> list[dict[str, Any]]:
         """Get data coverage information."""

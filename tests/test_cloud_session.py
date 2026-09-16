@@ -113,7 +113,7 @@ async def test_known_sport_types_map_to_readable_names(sport_type, expected):
     assert workouts[0].activity_type == expected
 
 
-async def test_unknown_sport_type_preserves_raw_numeric_string():
+async def test_unknown_sport_type_is_marked_rather_than_left_bare():
     adapter = CloudSessionAdapter(app_token="t1", user_id="u1")
     start_at = datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
     cast(Any, adapter)._client = WorkoutClient(start_at.timestamp(), 999)
@@ -121,7 +121,9 @@ async def test_unknown_sport_type_preserves_raw_numeric_string():
 
     workouts = [workout async for workout in adapter.iter_workouts()]
 
-    assert workouts[0].activity_type == "999"
+    # Marked, not bare: an unmapped code still carries its number, but "sport_999"
+    # cannot be mistaken for a real activity label the way "999" can.
+    assert workouts[0].activity_type == "sport_999"
 
 
 class HeartRateResponse:

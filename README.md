@@ -22,6 +22,11 @@ The current implementation supports:
 - passive and resting heart rate (`slp.rhr`)
 - workouts with readable sport names for known Zepp sport codes
 - weight and body-composition measurements
+- the device's UTC offset per day (`tz_offset_seconds`) -- the only location
+  signal the band provides, and what makes a multi-timezone series readable
+- the device's sleep-algorithm version per night (`algo_version`). Stage splits
+  are **not comparable across a change in this value**: a version bump can move
+  time between deep, light and REM without any change in the sleep itself.
 
 Cloud coverage can vary by account, region, and upstream endpoint stability.
 
@@ -184,6 +189,7 @@ All tool responses keep the backward-compatible JSON envelope with `status: "ok"
 | `query_workouts` | Query workouts with activity, duration, and distance filters |
 | `query_heart_rate` | Query resting/active/passive/workout heart-rate samples |
 | `query_body_measurements` | Query weight/body metrics with optional latest-only output |
+| `query_raw_payloads` | List verbatim upstream responses from the local archive |
 | `get_data_coverage` | Report first/last dates and days with data by type |
 
 ## Sync and storage behavior

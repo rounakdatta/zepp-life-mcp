@@ -31,6 +31,9 @@ class DailyActivity(BaseEntity):
     total_kcal: float | None = Field(None, ge=0, description="Total calories")
     floors: int | None = Field(None, ge=0, description="Floors climbed")
     active_minutes: int | None = Field(None, ge=0, description="Active minutes")
+    tz_offset_seconds: int | None = Field(
+        None, description="Device UTC offset that day, in seconds; the only location signal available"
+    )
 
 
 class SleepStage(BaseModel):
@@ -51,10 +54,22 @@ class SleepSession(BaseEntity):
     time_asleep_minutes: int = Field(ge=0, description="Actual sleep time")
     time_awake_minutes: int = Field(ge=0, description="Time awake during sleep")
     rem_minutes: int = Field(default=0, ge=0, description="Time in REM sleep")
+    deep_minutes: int = Field(default=0, ge=0, description="Time in deep sleep")
+    light_minutes: int = Field(default=0, ge=0, description="Time in light sleep")
     wake_count: int = Field(default=0, ge=0, description="Number of awake stages")
     sleep_score: int | None = Field(None, ge=0, le=100, description="Sleep quality score")
     is_nap: bool = Field(default=False, description="Whether this is a nap")
     stages: list[SleepStage] = Field(default_factory=list, description="Sleep stages breakdown")
+    tz_offset_seconds: int | None = Field(
+        None, description="Device UTC offset that day, in seconds"
+    )
+    algo_version: str | None = Field(
+        None,
+        description=(
+            "Device sleep-algorithm version. Stage splits are NOT comparable across "
+            "a change in this value."
+        ),
+    )
 
 
 class Workout(BaseEntity):
@@ -73,6 +88,9 @@ class Workout(BaseEntity):
     avg_pace_sec_per_km: float | None = Field(None, ge=0, description="Average pace")
     max_pace_sec_per_km: float | None = Field(None, ge=0, description="Maximum pace")
     total_steps: int | None = Field(None, ge=0, description="Steps during workout")
+    tz_offset_seconds: int | None = Field(
+        None, description="Device UTC offset that day, in seconds"
+    )
 
 
 class BodyMeasurement(BaseEntity):

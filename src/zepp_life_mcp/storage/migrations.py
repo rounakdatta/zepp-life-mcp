@@ -344,6 +344,34 @@ def _add_raw_payload_record_ids(conn: sqlite3.Connection) -> None:
         ON raw_payloads(endpoint, user_id, record_id)
     """)
 
+def _add_device_context(conn: sqlite3.Connection) -> None:
+    """Record where and with which algorithm each record was captured.
+
+    Two questions could not be answered from the typed tables at all. *Where was
+    the user* -- the band reports a timezone offset per day, which is the only
+    location signal available, and without it a trip is invisible. And *is this
+    row comparable to that one* -- the sleep algorithm changed version mid-2026
+    and silently redistributed time between stages, so a longitudinal query that
+    spans the change invents an effect. Both were sitting in the raw payloads
+    and nowhere else.
+    """
+    for table in ("sleep_sessions", "daily_activity", "workouts"):
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "tz_offset_seconds" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN tz_offset_seconds INTEGER")
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(sleep_sessions)")}
+    if "algo_version" not in columns:
+        conn.execute("ALTER TABLE sleep_sessions ADD COLUMN algo_version TEXT")
+
+    # rem_minutes had a column and deep did not, so deep sleep -- the stage people
+    # actually ask about -- could only be got by parsing the stages JSON of every
+    # row. Both are already computed during parsing; they just were not kept.
+    for column in ("deep_minutes", "light_minutes"):
+        if column not in columns:
+            conn.execute(
+                f"ALTER TABLE sleep_sessions ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+            )
+
 
 MIGRATIONS = (
     Migration(version=1, apply=_create_baseline_schema),
@@ -354,6 +382,7 @@ MIGRATIONS = (
     Migration(version=6, apply=_scope_cloud_record_ids),
     Migration(version=7, apply=_add_raw_payloads),
     Migration(version=8, apply=_add_raw_payload_record_ids),
+    Migration(version=9, apply=_add_device_context),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

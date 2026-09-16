@@ -129,6 +129,7 @@ class Database:
                     "total_kcal": activity.total_kcal,
                     "floors": activity.floors,
                     "active_minutes": activity.active_minutes,
+                    "tz_offset_seconds": activity.tz_offset_seconds,
                 },
             )
             conn.commit()
@@ -160,9 +161,13 @@ class Database:
                     "time_asleep_minutes": sleep.time_asleep_minutes,
                     "time_awake_minutes": sleep.time_awake_minutes,
                     "rem_minutes": sleep.rem_minutes,
+                    "deep_minutes": sleep.deep_minutes,
+                    "light_minutes": sleep.light_minutes,
                     "wake_count": sleep.wake_count,
                     "sleep_score": sleep.sleep_score,
                     "is_nap": sleep.is_nap,
+                    "tz_offset_seconds": sleep.tz_offset_seconds,
+                    "algo_version": sleep.algo_version,
                     "stages": json.dumps([stage.model_dump() for stage in sleep.stages]),
                 },
             )
@@ -202,6 +207,7 @@ class Database:
                     "avg_pace_sec_per_km": workout.avg_pace_sec_per_km,
                     "max_pace_sec_per_km": workout.max_pace_sec_per_km,
                     "total_steps": workout.total_steps,
+                    "tz_offset_seconds": workout.tz_offset_seconds,
                 },
             )
             conn.commit()

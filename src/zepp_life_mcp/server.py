@@ -56,6 +56,7 @@ CONNECTION_REQUIRED_TOOLS = {
     "query_workouts",
     "query_heart_rate",
     "query_body_measurements",
+    "query_raw_payloads",
     "get_data_coverage",
 }
 
@@ -176,8 +177,17 @@ TOOL_SPECS = (
                             "active_kcal",
                             "weight_kg",
                             "sleep_minutes",
+                            "sleep_deep_minutes",
+                            "sleep_rem_minutes",
+                            "sleep_awake_minutes",
+                            "sleep_wake_count",
+                            "sleep_score",
                         ],
-                        "description": "Metric to query",
+                        "description": (
+                            "Metric to query. The sleep_* metrics come back aggregated, which is "
+                            "how to ask a question about a year of nights without pulling every "
+                            "session."
+                        ),
                     },
                     "start_date": {
                         "type": "string",
@@ -319,6 +329,34 @@ TOOL_SPECS = (
                     },
                 },
                 "required": ["start_date", "end_date"],
+            },
+        ),
+        Tool(
+            name="query_raw_payloads",
+            description=(
+                "List verbatim upstream responses held in the local archive. The typed tables "
+                "keep a subset of what Zepp returns (193 fields per workout become a dozen); "
+                "this reaches the rest. Bodies are omitted unless include_payload is set, "
+                "because one band_data window can be several megabytes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "endpoint": {
+                        "type": "string",
+                        "description": (
+                            "e.g. band_data.summary, band_data.detail, sport.run.history, "
+                            "sport.run.detail, weight.records"
+                        ),
+                    },
+                    "start_date": {"type": "string", "description": "Start date (YYYY-MM-DD)"},
+                    "end_date": {"type": "string", "description": "End date (YYYY-MM-DD)"},
+                    "include_payload": {
+                        "type": "boolean",
+                        "description": "Include the decoded body. Large; defaults to false.",
+                    },
+                    "limit": {"type": "integer", "description": "Max rows (default 20)"},
+                },
             },
         ),
         Tool(
@@ -778,6 +816,27 @@ async def _handle_query_body_measurements(arguments: dict[str, Any]) -> dict[str
         }
 
 
+async def _handle_query_raw_payloads(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not context.query_service:
+        return {"status": "error", "error": "Query service not initialized"}
+    try:
+        rows = context.query_service.get_raw_payloads(
+            endpoint=arguments.get("endpoint"),
+            start_date=arguments.get("start_date"),
+            end_date=arguments.get("end_date"),
+            include_payload=bool(arguments.get("include_payload")),
+            limit=int(arguments.get("limit") or 20),
+        )
+        return QueryResponse(
+            status="ok",
+            source="cache",
+            data={"payloads": rows, "total_payloads": len(rows)},
+        ).model_dump()
+    except Exception:
+        logger.exception("Raw payload query failed")
+        return {"status": "error", "error": "Raw payload query failed"}
+
+
 async def _handle_get_data_coverage(arguments: dict[str, Any]) -> dict[str, Any]:
     if not context.query_service:
         return {
@@ -814,6 +873,7 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "query_workouts": _handle_query_workouts,
     "query_heart_rate": _handle_query_heart_rate,
     "query_body_measurements": _handle_query_body_measurements,
+    "query_raw_payloads": _handle_query_raw_payloads,
     "get_data_coverage": _handle_get_data_coverage,
 }
 

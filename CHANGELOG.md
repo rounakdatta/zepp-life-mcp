@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.0
+
+Everything here came out of actually using the server for an analysis and hitting
+the wall each time.
+
+### Added
+
+- `tz_offset_seconds` on sleep, daily activity and workouts. The band reports a
+  UTC offset per day and it is the only location signal available, so without it
+  a trip is invisible and "where was I" cannot be asked at all.
+- `algo_version` on sleep sessions. The device's sleep algorithm changed version
+  mid-2026 and silently redistributed time between stages; a longitudinal query
+  spanning that change invents an effect. The version is now attached to every
+  row so the discontinuity is visible instead of inferred.
+- `deep_minutes` and `light_minutes` as real columns. `rem_minutes` already had
+  one, so deep sleep -- the stage people actually ask about -- could previously
+  only be reached by parsing the stages JSON of every row.
+- Sleep metrics in `query_metric_series`: `sleep_deep_minutes`,
+  `sleep_rem_minutes`, `sleep_awake_minutes`, `sleep_wake_count`, `sleep_score`.
+  A year of nights is now a few hundred bytes instead of the ~400 KB a full
+  session dump costs.
+- `query_raw_payloads` tool. The archive held 193 fields per workout, GPS tracks
+  and per-second heart rate, and was reachable only by opening the SQLite file.
+  Bodies are omitted unless asked for.
+
+### Fixed
+
+- `query_sleep` and `query_workouts` now return `local_date` and `timezone`.
+  Both were stored and neither was ever serialized, so every session came back
+  without a date on it.
+- `is_nap` is now inferred rather than always false: under three hours AND
+  starting between 06:00 and 20:00 local. Zepp exposes no nap flag (`supNap`
+  only reports device capability), so this is explicitly a heuristic, and
+  nothing is classified when the day has no timezone offset.
+
+### Changed
+
+- An unmapped workout code is now `sport_204` rather than a bare `204`, which
+  was indistinguishable from a real activity label. **Breaking** for any caller
+  filtering `activity_types` on a raw numeric code.
+
 ## 0.3.3
 
 ### Fixed

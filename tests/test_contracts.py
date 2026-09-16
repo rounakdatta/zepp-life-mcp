@@ -17,7 +17,10 @@ EXPECTED_TOOL_SPECS = [
     {
         "name": "get_connection_status",
         "description": "Check connection status to data source and last sync time",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     },
     {
         "name": "sync_data",
@@ -27,26 +30,25 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "data_types": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Types of data to sync (daily_activity, sleep, heart_rate, workouts, "
-                        "body_measurements)"
-                    ),
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Types of data to sync (daily_activity, sleep, heart_rate, workouts, body_measurements)"
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD)",
+                    "description": "Start date (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date (YYYY-MM-DD)",
+                    "description": "End date (YYYY-MM-DD)"
                 },
                 "force_full_sync": {
                     "type": "boolean",
-                    "description": "Force full sync instead of incremental",
-                },
-            },
-        },
+                    "description": "Force full sync instead of incremental"
+                }
+            }
+        }
     },
     {
         "name": "get_profile",
@@ -56,10 +58,10 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "include_devices": {
                     "type": "boolean",
-                    "description": "Include connected devices information",
+                    "description": "Include connected devices information"
                 }
-            },
-        },
+            }
+        }
     },
     {
         "name": "get_daily_summary",
@@ -69,22 +71,22 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "date": {
                     "type": "string",
-                    "description": "Single date (YYYY-MM-DD)",
+                    "description": "Single date (YYYY-MM-DD)"
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date for range (YYYY-MM-DD)",
+                    "description": "Start date for range (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date for range (YYYY-MM-DD)",
+                    "description": "End date for range (YYYY-MM-DD)"
                 },
                 "timezone": {
                     "type": "string",
-                    "description": "Timezone (default from config)",
-                },
-            },
-        },
+                    "description": "Timezone (default from config)"
+                }
+            }
+        }
     },
     {
         "name": "query_metric_series",
@@ -100,30 +102,49 @@ EXPECTED_TOOL_SPECS = [
                         "active_kcal",
                         "weight_kg",
                         "sleep_minutes",
+                        "sleep_deep_minutes",
+                        "sleep_rem_minutes",
+                        "sleep_awake_minutes",
+                        "sleep_wake_count",
+                        "sleep_score"
                     ],
-                    "description": "Metric to query",
+                    "description": "Metric to query. The sleep_* metrics come back aggregated, which is how to ask a question about a year of nights without pulling every session."
                 },
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD)",
+                    "description": "Start date (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date (YYYY-MM-DD)",
+                    "description": "End date (YYYY-MM-DD)"
                 },
                 "granularity": {
                     "type": "string",
-                    "enum": ["day", "week", "month"],
-                    "description": "Aggregation granularity",
+                    "enum": [
+                        "day",
+                        "week",
+                        "month"
+                    ],
+                    "description": "Aggregation granularity"
                 },
                 "aggregation": {
                     "type": "string",
-                    "enum": ["sum", "avg", "min", "max", "latest"],
-                    "description": "Aggregation method",
-                },
+                    "enum": [
+                        "sum",
+                        "avg",
+                        "min",
+                        "max",
+                        "latest"
+                    ],
+                    "description": "Aggregation method"
+                }
             },
-            "required": ["metric", "start_date", "end_date"],
-        },
+            "required": [
+                "metric",
+                "start_date",
+                "end_date"
+            ]
+        }
     },
     {
         "name": "query_sleep",
@@ -133,23 +154,26 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD)",
+                    "description": "Start date (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date (YYYY-MM-DD)",
+                    "description": "End date (YYYY-MM-DD)"
                 },
                 "include_naps": {
                     "type": "boolean",
-                    "description": "Include nap sessions",
+                    "description": "Include nap sessions"
                 },
                 "include_stages": {
                     "type": "boolean",
-                    "description": "Include sleep stage breakdown",
-                },
+                    "description": "Include sleep stage breakdown"
+                }
             },
-            "required": ["start_date", "end_date"],
-        },
+            "required": [
+                "start_date",
+                "end_date"
+            ]
+        }
     },
     {
         "name": "query_workouts",
@@ -159,28 +183,33 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD)",
+                    "description": "Start date (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date (YYYY-MM-DD)",
+                    "description": "End date (YYYY-MM-DD)"
                 },
                 "activity_types": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Filter by activity types (running, cycling, etc.)",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Filter by activity types (running, cycling, etc.)"
                 },
                 "min_duration_minutes": {
                     "type": "integer",
-                    "description": "Minimum duration in minutes",
+                    "description": "Minimum duration in minutes"
                 },
                 "min_distance_km": {
                     "type": "number",
-                    "description": "Minimum distance in kilometers",
-                },
+                    "description": "Minimum distance in kilometers"
+                }
             },
-            "required": ["start_date", "end_date"],
-        },
+            "required": [
+                "start_date",
+                "end_date"
+            ]
+        }
     },
     {
         "name": "query_heart_rate",
@@ -190,24 +219,32 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD)",
+                    "description": "Start date (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date (YYYY-MM-DD)",
+                    "description": "End date (YYYY-MM-DD)"
                 },
                 "sample_type": {
                     "type": "string",
-                    "enum": ["resting", "active", "passive", "workout"],
-                    "description": "Filter by sample type",
+                    "enum": [
+                        "resting",
+                        "active",
+                        "passive",
+                        "workout"
+                    ],
+                    "description": "Filter by sample type"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of samples to return",
-                },
+                    "description": "Maximum number of samples to return"
+                }
             },
-            "required": ["start_date", "end_date"],
-        },
+            "required": [
+                "start_date",
+                "end_date"
+            ]
+        }
     },
     {
         "name": "query_body_measurements",
@@ -217,11 +254,11 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "Start date (YYYY-MM-DD)",
+                    "description": "Start date (YYYY-MM-DD)"
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date (YYYY-MM-DD)",
+                    "description": "End date (YYYY-MM-DD)"
                 },
                 "metrics": {
                     "type": "array",
@@ -232,18 +269,50 @@ EXPECTED_TOOL_SPECS = [
                             "bmi",
                             "body_fat_pct",
                             "muscle_mass_kg",
-                            "water_pct",
-                        ],
+                            "water_pct"
+                        ]
                     },
-                    "description": "Specific metrics to include",
+                    "description": "Specific metrics to include"
                 },
                 "latest_only": {
                     "type": "boolean",
-                    "description": "Return only the latest measurement",
-                },
+                    "description": "Return only the latest measurement"
+                }
             },
-            "required": ["start_date", "end_date"],
-        },
+            "required": [
+                "start_date",
+                "end_date"
+            ]
+        }
+    },
+    {
+        "name": "query_raw_payloads",
+        "description": "List verbatim upstream responses held in the local archive. The typed tables keep a subset of what Zepp returns (193 fields per workout become a dozen); this reaches the rest. Bodies are omitted unless include_payload is set, because one band_data window can be several megabytes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "endpoint": {
+                    "type": "string",
+                    "description": "e.g. band_data.summary, band_data.detail, sport.run.history, sport.run.detail, weight.records"
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start date (YYYY-MM-DD)"
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End date (YYYY-MM-DD)"
+                },
+                "include_payload": {
+                    "type": "boolean",
+                    "description": "Include the decoded body. Large; defaults to false."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max rows (default 20)"
+                }
+            }
+        }
     },
     {
         "name": "get_data_coverage",
@@ -253,19 +322,21 @@ EXPECTED_TOOL_SPECS = [
             "properties": {
                 "data_types": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Specific data types to check (default: all)",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Specific data types to check (default: all)"
                 }
-            },
-        },
-    },
+            }
+        }
+    }
 ]
 
 
 async def test_list_tools_schema_snapshot():
     tools = await list_tools()  # pyright: ignore[reportCallIssue]
 
-    assert len(tools) == 10
+    assert len(tools) == 11
     assert [
         {
             "name": tool.name,

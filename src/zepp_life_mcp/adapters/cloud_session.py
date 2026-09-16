@@ -267,6 +267,33 @@ class CloudSessionAdapter(DataAdapter):
                 if isinstance(row, dict):
                     yield row
 
+    @staticmethod
+    def _tz_offset(day_data: dict[str, Any]) -> int | None:
+        """The device's UTC offset for that day, in seconds.
+
+        This is the only location signal the band provides -- there is no GPS in
+        the daily summary -- so it is what makes "where was I" answerable at all.
+        """
+        try:
+            return int(day_data.get("tz"))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _looks_like_a_nap(start_at: datetime, offset: int | None, asleep_minutes: int) -> bool:
+        """Heuristic: a short sleep that starts in daylight hours.
+
+        Zepp exposes no nap flag -- `supNap` only says the device supports the
+        feature -- so this is inferred, not reported. Kept deliberately
+        conservative: under three hours AND beginning between 06:00 and 20:00
+        local. Without an offset the local hour is unknowable and nothing is
+        classified.
+        """
+        if offset is None or asleep_minutes >= 180:
+            return False
+        local_hour = (start_at + timedelta(seconds=offset)).hour
+        return 6 <= local_hour < 20
+
     def _workout_local_date(self, item: dict[str, Any]) -> str | None:
         start_time = item.get("start_time")
         end_time = item.get("end_time")
@@ -565,6 +592,7 @@ class CloudSessionAdapter(DataAdapter):
                         total_kcal=None,
                         floors=None,
                         active_minutes=None,
+                        tz_offset_seconds=self._tz_offset(day_data),
                     )
 
         except AdapterFetchError:
@@ -601,6 +629,7 @@ class CloudSessionAdapter(DataAdapter):
 
                 start_dt = self._utc_from_timestamp(start_ts)
                 end_dt = self._utc_from_timestamp(end_ts)
+                offset = self._tz_offset(day_data)
                 sleep = SleepSession(
                     id=f"cloud_sleep_{self.user_id}_{date_str}",
                     provider="zepp_life",
@@ -619,10 +648,17 @@ class CloudSessionAdapter(DataAdapter):
                     time_awake_minutes=metrics.awake_minutes,
                     sleep_score=metrics.score,
                     stages=metrics.stages,
+                    tz_offset_seconds=offset,
+                    algo_version=str(sleep_data.get("sleepAlgoVersion") or "") or None,
+                    is_nap=self._looks_like_a_nap(
+                        start_dt, offset, metrics.time_asleep_minutes
+                    ),
                 )
                 yield sleep.model_copy(
                     update={
                         "rem_minutes": metrics.rem_minutes,
+                        "deep_minutes": metrics.deep_minutes,
+                        "light_minutes": metrics.light_minutes,
                         "wake_count": metrics.wake_count,
                     }
                 )
@@ -771,7 +807,7 @@ class CloudSessionAdapter(DataAdapter):
                     workout_id=str(item.get("trackid")),
                     timezone=self.timezone,
                     local_date=workout_date,
-                    activity_type=SPORT_TYPE_MAP.get(raw_type, raw_type),
+                    activity_type=SPORT_TYPE_MAP.get(raw_type, f"sport_{raw_type}"),
                     start_at=start_at,
                     end_at=self._utc_from_timestamp(end_ts) if end_ts else datetime.now(UTC),
                     duration_minutes=duration_min,
