@@ -3,6 +3,7 @@
 import gzip
 import hashlib
 import json
+import logging
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,6 +19,8 @@ from zepp_life_mcp.models import (
     Workout,
 )
 from zepp_life_mcp.storage.migrations import run_migrations
+
+logger = logging.getLogger(__name__)
 
 
 class UpsertOutcome(StrEnum):
@@ -47,7 +50,15 @@ class Database:
         # instead of failing on SQLITE_BUSY; it is stored in the file header, so
         # setting it once here is enough.
         with self._get_connection() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError as exc:
+                # Switching journal mode wants a brief exclusive lock, so a second
+                # process opening the same file at the same moment loses the race.
+                # That is harmless: journal_mode lives in the file header, so
+                # whoever won has already set it for everyone, and a concurrent
+                # opener is evidence the database is in use rather than broken.
+                logger.debug("Could not set journal_mode=WAL: %s", exc)
 
     @contextmanager
     def _get_connection(self):

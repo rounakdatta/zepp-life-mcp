@@ -35,6 +35,12 @@ the wall each time.
   only reports device capability), so this is explicitly a heuristic, and
   nothing is classified when the day has no timezone offset.
 
+- Setting `journal_mode=WAL` at open is now best-effort. It needs a brief
+  exclusive lock, so two processes opening the same database at once made one of
+  them raise `database is locked` -- introduced in 0.3.2 and only reproducible
+  under real contention. The mode lives in the file header, so whichever opener
+  wins has already set it for the others.
+
 ### Changed
 
 - An unmapped workout code is now `sport_204` rather than a bare `204`, which
