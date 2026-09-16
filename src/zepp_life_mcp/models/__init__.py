@@ -91,6 +91,8 @@ class Workout(BaseEntity):
     tz_offset_seconds: int | None = Field(
         None, description="Device UTC offset that day, in seconds"
     )
+    city: str | None = Field(None, description="City the device reported for this workout")
+    geohash: str | None = Field(None, description="Geohash the device reported for this workout")
 
 
 class BodyMeasurement(BaseEntity):

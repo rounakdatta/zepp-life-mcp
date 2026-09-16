@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1
+
+### Added
+
+- Workouts now carry the place they happened: `city`, `geohash` and a real
+  `timezone`, all read from the upstream record's own `syncedTimezone`, `city`
+  and `location` fields. All three were present on every sync and none reached
+  the database. `tz_offset_seconds` is derived from the zone at the workout's
+  own instant, so daylight saving resolves correctly instead of being assumed.
+  This is strictly better than the daily summary's numeric offset: it names the
+  city rather than leaving a UTC offset to be guessed at.
+
 ## 0.4.0
 
 Everything here came out of actually using the server for an analysis and hitting

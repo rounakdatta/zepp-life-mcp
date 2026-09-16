@@ -219,6 +219,8 @@ class Database:
                     "max_pace_sec_per_km": workout.max_pace_sec_per_km,
                     "total_steps": workout.total_steps,
                     "tz_offset_seconds": workout.tz_offset_seconds,
+                    "city": workout.city,
+                    "geohash": workout.geohash,
                 },
             )
             conn.commit()

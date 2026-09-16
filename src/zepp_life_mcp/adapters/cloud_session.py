@@ -796,6 +796,21 @@ class CloudSessionAdapter(DataAdapter):
                 duration_min = int(float(run_time)) // 60 if run_time else 0
                 raw_type = str(item.get("type", "unknown"))
 
+                # The workout knows its own zone, unlike the daily summary which
+                # only gives a numeric offset. Prefer it, and derive the offset
+                # from it so all three tables answer the same question.
+                zone_name = str(item.get("syncedTimezone") or "").strip()
+                workout_timezone = self.timezone
+                offset_seconds: int | None = None
+                if zone_name:
+                    try:
+                        zone = ZoneInfo(zone_name)
+                        workout_timezone = zone_name
+                        offset = start_at.astimezone(zone).utcoffset()
+                        offset_seconds = int(offset.total_seconds()) if offset else None
+                    except Exception:
+                        logger.debug("Unrecognised workout timezone %r", zone_name)
+
                 yield Workout(
                     id=f"cloud_{self.user_id}_{item.get('trackid')}",
                     provider="zepp_life",
@@ -805,7 +820,7 @@ class CloudSessionAdapter(DataAdapter):
                     device_id=None,
                     collected_at=None,
                     workout_id=str(item.get("trackid")),
-                    timezone=self.timezone,
+                    timezone=workout_timezone,
                     local_date=workout_date,
                     activity_type=SPORT_TYPE_MAP.get(raw_type, f"sport_{raw_type}"),
                     start_at=start_at,
@@ -822,6 +837,9 @@ class CloudSessionAdapter(DataAdapter):
                     avg_pace_sec_per_km=None,
                     max_pace_sec_per_km=None,
                     total_steps=None,
+                    tz_offset_seconds=offset_seconds,
+                    city=str(item.get("city") or "").strip() or None,
+                    geohash=str(item.get("location") or "").strip() or None,
                 )
 
         except AdapterFetchError:

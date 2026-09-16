@@ -2,8 +2,8 @@ apiVersion: v2
 name: zepp-life-mcp
 description: MCP server over HTTP for a locally archived Zepp Life dataset
 type: application
-version: 0.4.0
-appVersion: "0.4.0"
+version: 0.4.1
+appVersion: "0.4.1"
 keywords:
   - mcp
   - zepp-life

@@ -22,6 +22,7 @@ The current implementation supports:
 - passive and resting heart rate (`slp.rhr`)
 - workouts with readable sport names for known Zepp sport codes
 - weight and body-composition measurements
+- for workouts: the reported `city`, a `geohash` and the recording `timezone`
 - the device's UTC offset per day (`tz_offset_seconds`) -- the only location
   signal the band provides, and what makes a multi-timezone series readable
 - the device's sleep-algorithm version per night (`algo_version`). Stage splits

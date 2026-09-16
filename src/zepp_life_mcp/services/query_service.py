@@ -242,7 +242,10 @@ class QueryService:
                     "max_pace_sec_per_km": record.get("max_pace_sec_per_km"),
                     "total_steps": record.get("total_steps"),
                     "local_date": record.get("local_date"),
+                    "timezone": record.get("timezone"),
                     "tz_offset_seconds": record.get("tz_offset_seconds"),
+                    "city": record.get("city"),
+                    "geohash": record.get("geohash"),
                 }
             )
 

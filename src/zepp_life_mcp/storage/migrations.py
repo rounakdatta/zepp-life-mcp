@@ -373,6 +373,19 @@ def _add_device_context(conn: sqlite3.Connection) -> None:
             )
 
 
+def _add_workout_place(conn: sqlite3.Connection) -> None:
+    """Workouts know where they happened; the adapter was throwing it away.
+
+    The upstream summary carries `syncedTimezone` (an IANA name), `city` and
+    `location` (a geohash) -- real location, not the offset guesswork the daily
+    summary forces. None of it reached the database.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(workouts)")}
+    for column in ("city", "geohash"):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE workouts ADD COLUMN {column} TEXT")
+
+
 MIGRATIONS = (
     Migration(version=1, apply=_create_baseline_schema),
     Migration(version=2, apply=_add_device_keys, destructive=True),
@@ -383,6 +396,7 @@ MIGRATIONS = (
     Migration(version=7, apply=_add_raw_payloads),
     Migration(version=8, apply=_add_raw_payload_record_ids),
     Migration(version=9, apply=_add_device_context),
+    Migration(version=10, apply=_add_workout_place),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

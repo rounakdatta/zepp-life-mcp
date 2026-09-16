@@ -163,3 +163,58 @@ async def test_raw_archive_is_reachable_without_opening_the_sqlite_file(tmp_path
 
     rows = q.get_raw_payloads(endpoint="sport.run.detail", include_payload=True)
     assert rows[0]["payload"]["data"]["longitude_latitude"] == "1,2;3,4"
+
+
+class WorkoutHistoryClient:
+    def __init__(self, items):
+        self.items = items
+
+    async def get(self, url, params=None, **kwargs):
+        return FakeResponse({"data": {"summary": self.items}})
+
+
+def _workout_adapter(items):
+    adapter = CloudSessionAdapter(app_token="t", user_id="u1", timezone="Asia/Kolkata")
+    cast(Any, adapter)._client = WorkoutHistoryClient(items)
+    adapter._connected = True
+    return adapter
+
+
+def workout_item(**over):
+    base = {
+        "trackid": "t1",
+        "type": "1",
+        "end_time": str(int(datetime(2026, 8, 20, 2, 0, tzinfo=UTC).timestamp())),
+        "run_time": "3600",
+        "dis": "10000",
+    }
+    base.update(over)
+    return base
+
+
+async def test_workout_place_is_taken_from_the_workout_not_guessed():
+    """syncedTimezone, city and geohash were all present upstream and all discarded."""
+    items = [workout_item(syncedTimezone="America/Los_Angeles", city="San Francisco",
+                          location="9q8yyk8ytpxr")]
+    got = [w async for w in _workout_adapter(items).iter_workouts()]
+    w = got[0]
+    assert w.timezone == "America/Los_Angeles"
+    assert w.city == "San Francisco"
+    assert w.geohash == "9q8yyk8ytpxr"
+    # offset derived from the zone AT THAT INSTANT, so DST is handled for free
+    assert w.tz_offset_seconds == -25200
+
+
+async def test_workout_without_a_zone_falls_back_to_the_configured_one():
+    got = [w async for w in _workout_adapter([workout_item()]).iter_workouts()]
+    assert got[0].timezone == "Asia/Kolkata"
+    assert got[0].tz_offset_seconds is None
+    assert got[0].city is None
+
+
+async def test_unrecognised_workout_zone_does_not_break_the_sync():
+    items = [workout_item(syncedTimezone="Mars/Olympus_Mons", city="Elysium")]
+    got = [w async for w in _workout_adapter(items).iter_workouts()]
+    assert got[0].timezone == "Asia/Kolkata"
+    assert got[0].tz_offset_seconds is None
+    assert got[0].city == "Elysium", "a bad zone must not discard the rest of the place"
