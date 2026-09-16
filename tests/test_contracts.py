@@ -323,7 +323,7 @@ def test_query_response_contract(status):
         (
             ["sync", "--help"],
             [
-                "--type {daily_activity,sleep,workouts,body_measurements,heart_rate}",
+                "--type {daily_activity,sleep,heart_rate,workouts,workout_details,body_measurements}",
                 "--start-date START_DATE",
                 "--end-date END_DATE",
             ],

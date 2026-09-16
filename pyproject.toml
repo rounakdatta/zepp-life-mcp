@@ -30,6 +30,8 @@ dependencies = [
     "keyring>=25.0.0",
     "click>=8.0.0",
     "rich>=13.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]

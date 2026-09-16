@@ -292,6 +292,58 @@ def _scope_cloud_record_ids(conn: sqlite3.Connection) -> None:
             (prefix, len(prefix) + 1, f"{prefix}%"),
         )
 
+def _add_raw_payloads(conn: sqlite3.Connection) -> None:
+    """Archive every upstream response verbatim so mapping stays replayable.
+
+    The mapped tables are lossy by construction: Zepp returns ~193 fields per
+    workout and the typed schema keeps a handful. Keeping the compressed source
+    payload means a future mapping change can be backfilled from local data
+    instead of re-fetching from an account that may no longer serve it.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS raw_payloads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL DEFAULT 'zepp_life',
+            source_type TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            request_params TEXT NOT NULL,
+            window_start TEXT,
+            window_end TEXT,
+            fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            http_status INTEGER,
+            content_encoding TEXT NOT NULL DEFAULT 'gzip',
+            payload_sha256 TEXT NOT NULL,
+            payload_bytes INTEGER NOT NULL,
+            payload BLOB NOT NULL,
+            UNIQUE(source_type, user_id, endpoint, window_start, window_end, payload_sha256)
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_raw_payloads_lookup
+        ON raw_payloads(source_type, user_id, endpoint, window_start)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_raw_payloads_fetched
+        ON raw_payloads(fetched_at)
+    """)
+
+def _add_raw_payload_record_ids(conn: sqlite3.Connection) -> None:
+    """Identify payloads that are fetched one per record, not one per window.
+
+    Workout tracks come from run/detail.json keyed by trackid, so "have I
+    already archived this one?" has to be answerable without decompressing
+    every stored blob. Window columns cannot express that: two workouts on the
+    same day share a date.
+    """
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(raw_payloads)")}
+    if "record_id" not in columns:
+        conn.execute("ALTER TABLE raw_payloads ADD COLUMN record_id TEXT")
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_raw_payloads_record
+        ON raw_payloads(endpoint, user_id, record_id)
+    """)
+
 
 MIGRATIONS = (
     Migration(version=1, apply=_create_baseline_schema),
@@ -300,6 +352,8 @@ MIGRATIONS = (
     Migration(version=4, apply=_add_local_dates),
     Migration(version=5, apply=_add_sleep_metrics),
     Migration(version=6, apply=_scope_cloud_record_ids),
+    Migration(version=7, apply=_add_raw_payloads),
+    Migration(version=8, apply=_add_raw_payload_record_ids),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

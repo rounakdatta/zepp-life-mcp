@@ -1,0 +1,388 @@
+"""Coverage guarantees for the band_data row cap, and the raw payload archive."""
+
+from datetime import date, timedelta
+from typing import Any, cast
+
+from zepp_life_mcp.adapters import cloud_session
+from zepp_life_mcp.adapters.cloud_session import CloudSessionAdapter
+from zepp_life_mcp.services.sync_service import SyncService
+from zepp_life_mcp.storage import Database
+
+
+class FakeResponse:
+    status_code = 200
+
+    def __init__(self, payload: dict[str, Any]):
+        self.payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self.payload
+
+
+class CappedBandClient:
+    """Stands in for band_data.json, including its truncation behaviour.
+
+    The real endpoint answers HTTP 200 with at most `cap` rows and drops the
+    MOST RECENT dates when it truncates, which is what makes the data loss
+    invisible to a caller that only checks the status code.
+    """
+
+    def __init__(
+        self,
+        cap: int = 500,
+        first_day: str = "2024-01-01",
+        rows_per_day: int = 1,
+    ):
+        self.cap = cap
+        self.first_day = date.fromisoformat(first_day)
+        self.rows_per_day = rows_per_day
+        self.windows: list[tuple[str, str]] = []
+
+    async def get(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any):
+        params = params or {}
+        start = max(date.fromisoformat(params["from_date"]), self.first_day)
+        end = date.fromisoformat(params["to_date"])
+        self.windows.append((params["from_date"], params["to_date"]))
+
+        rows = []
+        day = start
+        while day <= end:
+            for device in range(self.rows_per_day):
+                rows.append(
+                    {
+                        "date_time": day.isoformat(),
+                        "device_id": f"band-{device}",
+                        "summary": {"stp": {"ttl": 100, "dis": 200, "cal": 30}},
+                    }
+                )
+            day += timedelta(days=1)
+
+        return FakeResponse({"data": rows[: self.cap]})
+
+
+def _adapter(client: CappedBandClient) -> CloudSessionAdapter:
+    adapter = CloudSessionAdapter(app_token="t", user_id="u1")
+    cast(Any, adapter)._client = client
+    adapter._connected = True
+    return adapter
+
+
+async def test_range_wider_than_the_row_cap_still_returns_the_most_recent_days():
+    """Regression: one request for a wide range silently lost the newest dates.
+
+    Upstream caps at 500 rows counted from the oldest end, so a single
+    2020-01-01..today request returned data that stopped months before today
+    while still reporting HTTP 200.
+    """
+    client = CappedBandClient(cap=500, first_day="2024-01-01")
+    adapter = _adapter(client)
+
+    start, end = "2024-01-01", "2026-09-16"
+    activities = [a async for a in adapter.iter_daily_activity(start, end)]
+
+    expected_days = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+    assert len(activities) == expected_days
+    assert activities[0].date == start
+    assert activities[-1].date == end
+
+    # every window actually issued stayed inside the cap
+    assert len(client.windows) > 1
+    for window_start, window_end in client.windows:
+        span = (date.fromisoformat(window_end) - date.fromisoformat(window_start)).days + 1
+        assert span <= cloud_session.BAND_DATA_WINDOW_DAYS
+
+
+async def test_windows_halve_when_a_response_comes_back_at_the_cap():
+    """Rows are per (date, device), so the cap can be hit well inside a window.
+
+    A two-device account emits two rows per date, which puts a 400-day window at
+    800 rows and back over the cap. The window has to shrink itself.
+    """
+    client = CappedBandClient(
+        cap=cloud_session.BAND_DATA_ROW_CAP, first_day="2024-01-01", rows_per_day=2
+    )
+    adapter = _adapter(client)
+
+    start, end = "2024-01-01", "2024-12-31"
+    activities = [a async for a in adapter.iter_daily_activity(start, end)]
+
+    expected_days = (date.fromisoformat(end) - date.fromisoformat(start)).days + 1
+    dates = [a.date for a in activities]
+    assert dates == sorted(dates)
+    assert len(set(dates)) == expected_days, "chunking must not drop or duplicate days"
+
+    # it shrank below the starting window rather than accepting a capped response
+    spans = [
+        (date.fromisoformat(b) - date.fromisoformat(a)).days + 1 for a, b in client.windows
+    ]
+    assert min(spans) < cloud_session.BAND_DATA_WINDOW_DAYS
+
+
+async def test_windows_are_contiguous_and_non_overlapping():
+    client = CappedBandClient(cap=500, first_day="2024-01-01")
+    adapter = _adapter(client)
+
+    _ = [a async for a in adapter.iter_daily_activity("2024-01-01", "2026-09-16")]
+
+    covered: list[tuple[date, date]] = []
+    for window_start, window_end in client.windows:
+        covered.append((date.fromisoformat(window_start), date.fromisoformat(window_end)))
+
+    # windows that were retried at a smaller size share a start; keep the last try
+    accepted: dict[date, date] = {}
+    for window_start, window_end in covered:
+        accepted[window_start] = window_end
+
+    cursor = date.fromisoformat("2024-01-01")
+    for window_start in sorted(accepted):
+        if window_start < cursor:
+            continue
+        assert window_start == cursor, f"gap before {window_start}"
+        cursor = accepted[window_start] + timedelta(days=1)
+    assert cursor == date.fromisoformat("2026-09-17")
+
+
+async def test_sync_archives_raw_payloads_and_replays_them(tmp_path):
+    db = Database(tmp_path / "raw.db")
+    client = CappedBandClient(cap=500, first_day="2026-01-01")
+    adapter = _adapter(client)
+
+    service = SyncService(adapter, db)
+    result = await service.sync_data_type(
+        "daily_activity", start_date="2026-01-01", end_date="2026-03-01"
+    )
+    assert result["added"] == 60
+
+    stats = db.raw_payload_stats(user_id="u1")
+    assert [row["endpoint"] for row in stats] == ["band_data.summary"]
+    assert stats[0]["payloads"] == 1
+    assert stats[0]["stored_bytes"] < stats[0]["uncompressed_bytes"], "archive is compressed"
+
+    replayed = list(db.read_raw_payloads(user_id="u1", endpoint="band_data.summary"))
+    assert len(replayed) == 1
+    rows = replayed[0]["payload"]["data"]
+    assert len(rows) == 60
+    # the archive keeps fields the typed schema has no column for
+    assert rows[0]["summary"]["stp"]["cal"] == 30
+    assert replayed[0]["window_start"] == "2026-01-01"
+    assert replayed[0]["window_end"] == "2026-03-01"
+
+
+async def test_archiving_can_be_disabled(tmp_path):
+    db = Database(tmp_path / "noraw.db")
+    adapter = _adapter(CappedBandClient(cap=500, first_day="2026-01-01"))
+
+    service = SyncService(adapter, db, archive_raw=False)
+    await service.sync_data_type("daily_activity", start_date="2026-01-01", end_date="2026-01-31")
+
+    assert db.raw_payload_stats() == []
+
+
+async def test_identical_refetch_dedupes_but_changed_content_is_versioned(tmp_path):
+    db = Database(tmp_path / "dedupe.db")
+    adapter = _adapter(CappedBandClient(cap=500, first_day="2026-01-01"))
+    service = SyncService(adapter, db)
+
+    for _ in range(3):
+        await service.sync_data_type(
+            "daily_activity", start_date="2026-01-01", end_date="2026-01-31", force_full=True
+        )
+    assert db.raw_payload_stats(user_id="u1")[0]["payloads"] == 1
+
+    # a later fetch that sees different upstream content appends a version
+    cast(Any, adapter)._client = CappedBandClient(cap=500, first_day="2026-01-02")
+    await service.sync_data_type(
+        "daily_activity", start_date="2026-01-01", end_date="2026-01-31", force_full=True
+    )
+    assert db.raw_payload_stats(user_id="u1")[0]["payloads"] == 2
+
+
+class WorkoutDetailClient:
+    """Fake run/history.json + run/detail.json pair."""
+
+    def __init__(self, trackids: list[str], failing: set[str] | None = None):
+        self.trackids = trackids
+        self.failing = failing or set()
+        self.detail_calls: list[str] = []
+
+    async def get(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any):
+        params = params or {}
+        if "history" in url:
+            return FakeResponse(
+                {
+                    "data": {
+                        "summary": [
+                            {
+                                "trackid": t,
+                                "source": "run.mifit.huami.com",
+                                "end_time": str(1_700_000_000 + i * 86400),
+                                "run_time": "3600",
+                                "type": "1",
+                                "dis": "10000",
+                            }
+                            for i, t in enumerate(self.trackids)
+                        ]
+                    }
+                }
+            )
+        trackid = params["trackid"]
+        self.detail_calls.append(trackid)
+        if trackid in self.failing:
+            response = FakeResponse({"error": "gone"})
+            response.status_code = 404
+            return response
+        return FakeResponse({"data": {"trackid": trackid, "longitude_latitude": "1,2;3,4"}})
+
+
+async def test_workout_details_are_archived_once_then_skipped(tmp_path):
+    """The expensive pass must be a one-time backfill, not a per-sync refetch."""
+    db = Database(tmp_path / "details.db")
+    client = WorkoutDetailClient(["t1", "t2", "t3"])
+    adapter = _adapter(client)
+    service = SyncService(adapter, db)
+
+    first = await service.sync_data_type("workout_details", start_date="2000-01-01")
+    assert (first["added"], first["skipped"]) == (3, 0)
+    assert client.detail_calls == ["t1", "t2", "t3"]
+
+    second = await service.sync_data_type("workout_details", start_date="2000-01-01")
+    assert (second["added"], second["skipped"]) == (0, 3)
+    assert client.detail_calls == ["t1", "t2", "t3"], "must not refetch what it has"
+
+    # a new workout appears -> only that one is fetched
+    client.trackids.append("t4")
+    third = await service.sync_data_type("workout_details", start_date="2000-01-01")
+    assert (third["added"], third["skipped"]) == (1, 3)
+    assert client.detail_calls[-1] == "t4"
+
+    assert db.archived_record_ids("sport.run.detail", "u1") == {"t1", "t2", "t3", "t4"}
+    payloads = list(db.read_raw_payloads(endpoint="sport.run.detail"))
+    assert {p["record_id"] for p in payloads} == {"t1", "t2", "t3", "t4"}
+    assert payloads[0]["payload"]["data"]["longitude_latitude"] == "1,2;3,4"
+
+
+async def test_one_unavailable_track_does_not_abandon_the_backfill(tmp_path):
+    db = Database(tmp_path / "partial.db")
+    client = WorkoutDetailClient(["t1", "t2", "t3"], failing={"t2"})
+    service = SyncService(_adapter(client), db)
+
+    result = await service.sync_data_type("workout_details", start_date="2000-01-01")
+
+    assert result["added"] == 2
+    assert db.archived_record_ids("sport.run.detail", "u1") == {"t1", "t3"}
+
+
+async def test_default_sync_types_are_deterministic_and_include_details():
+    adapter = CloudSessionAdapter(app_token="t", user_id="u1")
+    adapter._connected = True
+    adapter._available_types = list(cloud_session.CLOUD_DATA_TYPES)
+
+    types = adapter.get_available_data_types()
+    assert types == [
+        "daily_activity",
+        "sleep",
+        "heart_rate",
+        "workouts",
+        "workout_details",
+        "body_measurements",
+    ]
+    assert types == adapter.get_available_data_types(), "must not vary between calls"
+
+
+async def test_export_mode_skips_workout_details_instead_of_failing(tmp_path):
+    """A default sync lists every type; a source that cannot serve one must no-op."""
+
+    class NoDetailAdapter:
+        source_type = "export_file"
+
+        def is_connected(self):
+            return True
+
+        def get_user_id(self):
+            return "u1"
+
+    db = Database(tmp_path / "export.db")
+    result = await SyncService(cast(Any, NoDetailAdapter()), db).sync_data_type(
+        "workout_details", start_date="2024-01-01", end_date="2024-12-31"
+    )
+    assert result["added"] == 0
+
+
+async def test_read_only_serves_queries_without_an_upstream_connection(monkeypatch, tmp_path):
+    """An expired apptoken must break sync, not queries whose data is on disk."""
+    from zepp_life_mcp import server
+
+    class DeadAdapter:
+        """Configured but unable to reach Zepp, as with a lapsed token."""
+
+        def is_connected(self):
+            return False
+
+        def connect(self):
+            return False
+
+        def get_user_id(self):
+            return "u1"
+
+    from zepp_life_mcp.services.query_service import QueryService
+
+    db = Database(tmp_path / "ro.db")
+    monkeypatch.setattr(server.context, "db", db)
+    monkeypatch.setattr(server.context, "adapter", cast(Any, DeadAdapter()))
+    monkeypatch.setattr(server.context, "query_service", QueryService(db, "u1"))
+    monkeypatch.setattr(server.context, "read_only", True)
+
+    tools = [tool.name for tool in await server.list_tools()]
+    assert "sync_data" not in tools, "read-only must not advertise a writer tool"
+    assert "query_workouts" in tools
+
+    result = await server.call_tool("sync_data", {})
+    assert result.isError
+    assert "read-only" in result.content[0].text
+
+    # a query still runs: it reads SQLite, never the adapter
+    result = await server.call_tool(
+        "query_workouts", {"start_date": "2024-01-01", "end_date": "2024-12-31"}
+    )
+    assert not result.isError
+
+
+async def test_archive_owner_is_resolved_without_a_connection(tmp_path):
+    """Regression: a lapsed token made every query return empty with status ok.
+
+    QueryService was constructed with user_id "unknown" whenever the adapter was
+    not connected, so it filtered against a user that owns no rows. Empty results
+    and a success status read as "you have no data", not "this is misconfigured".
+    """
+    from zepp_life_mcp.models import DailyActivity
+
+    db = Database(tmp_path / "owner.db")
+    assert db.sole_user_id() is None
+
+    db.upsert_daily_activity(
+        DailyActivity(
+            id="a1",
+            provider="zepp_life",
+            source_type="cloud_session",
+            user_id="3308073311",
+            date="2026-09-01",
+            steps=100,
+            distance_m=200,
+            active_kcal=30,
+        )
+    )
+    assert db.sole_user_id() == "3308073311"
+
+    db.upsert_daily_activity(
+        DailyActivity(
+            id="b1",
+            provider="zepp_life",
+            source_type="cloud_session",
+            user_id="other-user",
+            date="2026-09-01",
+            steps=100,
+            distance_m=200,
+            active_kcal=30,
+        )
+    )
+    assert db.sole_user_id() is None, "ambiguous ownership must not be guessed"

@@ -2,8 +2,28 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`band_data.json` truncation silently dropped the newest data.** The endpoint caps
+  every response at 500 rows and discards the most recent dates when it does, while
+  still returning HTTP 200. A single request for the default full-sync range
+  (`2020-01-01`..today) therefore returned history that stopped months early, and the
+  sync cursor then advanced past the missing days so they were never refetched.
+  Requests are now split into windows that stay under the cap, and a window that
+  still comes back at the cap halves itself and retries. Verified against a live
+  account: the same range went from 500 days ending 2026-07-11 to 566 days ending
+  2026-09-15, recovering 66 days.
+
 ### Added
 
+- `raw_payloads` table archiving every upstream response verbatim (gzipped, deduplicated
+  by content hash, append-only so a changed refetch is versioned rather than overwritten),
+  with `Database.read_raw_payloads()` to replay them and `Database.raw_payload_stats()`
+  to summarize. The typed tables are lossy by construction — Zepp returns 193 fields per
+  workout and the schema keeps 8 — so the archive keeps a mapping change backfillable
+  from local data instead of requiring a refetch.
+- `store_raw_payloads` config flag is honoured again; it was previously documented as a
+  no-op and gated nothing.
 - Python 3.13 CI coverage and post-build wheel/CLI smoke testing
 - resting heart-rate samples from sleep summaries
 - REM minutes, wake counts, readable workout sport names, and all documented metric aggregations

@@ -1,7 +1,10 @@
 """SQLite storage layer for Zepp MCP."""
 
+import gzip
+import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -39,12 +42,20 @@ class Database:
         """Initialize database schema."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         run_migrations(self.db_path)
+        # A deployment runs sync in one process and serving in another against
+        # the same file. WAL lets the reader keep working through a write
+        # instead of failing on SQLITE_BUSY; it is stored in the file header, so
+        # setting it once here is enough.
+        with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
 
     @contextmanager
     def _get_connection(self):
         """Get database connection with row factory."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        # Wait out a concurrent writer rather than raising immediately.
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
         finally:
@@ -263,6 +274,156 @@ class Database:
 
     def insert_heart_rate_sample(self, sample: HeartRateSample) -> bool:
         return self.upsert_heart_rate_sample(sample) == UpsertOutcome.INSERTED
+
+    def record_raw_payload(
+        self,
+        *,
+        source_type: str,
+        user_id: str,
+        endpoint: str,
+        payload: Any,
+        request_params: dict[str, Any] | None = None,
+        window_start: str | None = None,
+        window_end: str | None = None,
+        http_status: int | None = None,
+        record_id: str | None = None,
+        provider: str = "zepp_life",
+    ) -> bool:
+        """Archive one upstream response verbatim, gzipped.
+
+        Returns True when a new row was written, False when an identical payload
+        for the same endpoint and window is already archived. Re-fetching a
+        window whose content has changed appends a new row rather than
+        overwriting, so the archive is append-only and never loses a version.
+        """
+        body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(body).hexdigest()
+        blob = gzip.compress(body)
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO raw_payloads (
+                    provider, source_type, user_id, endpoint, request_params,
+                    window_start, window_end, http_status, record_id, content_encoding,
+                    payload_sha256, payload_bytes, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'gzip', ?, ?, ?)
+                """,
+                (
+                    provider,
+                    source_type,
+                    user_id,
+                    endpoint,
+                    json.dumps(request_params or {}, sort_keys=True),
+                    window_start,
+                    window_end,
+                    http_status,
+                    record_id,
+                    digest,
+                    len(body),
+                    blob,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def sole_user_id(self) -> str | None:
+        """The one user_id present in this database, or None if 0 or many.
+
+        A served instance must be able to answer from the archive without a
+        working upstream connection, which is the only other way to learn whose
+        data it holds.
+        """
+        tables = (
+            "daily_activity",
+            "sleep_sessions",
+            "workouts",
+            "body_measurements",
+            "heart_rate_samples",
+        )
+        union = " UNION ".join(f"SELECT DISTINCT user_id FROM {table}" for table in tables)
+        with self._get_connection() as conn:
+            rows = conn.execute(f"SELECT DISTINCT user_id FROM ({union}) LIMIT 2").fetchall()
+        return str(rows[0]["user_id"]) if len(rows) == 1 else None
+
+    def archived_record_ids(self, endpoint: str, user_id: str) -> set[str]:
+        """Record IDs already archived for a per-record endpoint.
+
+        Lets an incremental backfill skip what it has, so the expensive first
+        pass over a full workout history happens exactly once.
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT record_id FROM raw_payloads "
+                "WHERE endpoint = ? AND user_id = ? AND record_id IS NOT NULL",
+                (endpoint, user_id),
+            ).fetchall()
+        return {str(row["record_id"]) for row in rows}
+
+    def read_raw_payloads(
+        self,
+        source_type: str | None = None,
+        user_id: str | None = None,
+        endpoint: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Replay archived payloads, newest fetch first, with JSON decoded.
+
+        This is the entry point for re-deriving metrics the typed tables do not
+        carry: iterate the raw responses and map them however you like.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("source_type", source_type),
+            ("user_id", user_id),
+            ("endpoint", endpoint),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if start_date is not None:
+            clauses.append("(window_end IS NULL OR window_end >= ?)")
+            params.append(start_date)
+        if end_date is not None:
+            clauses.append("(window_start IS NULL OR window_start <= ?)")
+            params.append(end_date)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM raw_payloads {where} ORDER BY fetched_at DESC, id DESC",
+                tuple(params),
+            ).fetchall()
+
+        for row in rows:
+            record = dict(row)
+            record["payload"] = json.loads(gzip.decompress(row["payload"]).decode("utf-8"))
+            record["request_params"] = json.loads(row["request_params"])
+            yield record
+
+    def raw_payload_stats(self, user_id: str | None = None) -> list[dict[str, Any]]:
+        """Summarize the raw archive by endpoint."""
+        predicate = "WHERE user_id = ?" if user_id else ""
+        params = (user_id,) if user_id else ()
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT endpoint,
+                       COUNT(*) AS payloads,
+                       SUM(payload_bytes) AS uncompressed_bytes,
+                       SUM(LENGTH(payload)) AS stored_bytes,
+                       MIN(window_start) AS first_window,
+                       MAX(window_end) AS last_window,
+                       MAX(fetched_at) AS last_fetched_at
+                FROM raw_payloads {predicate}
+                GROUP BY endpoint
+                ORDER BY endpoint
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_sync_state(
         self,

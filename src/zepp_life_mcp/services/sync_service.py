@@ -15,15 +15,22 @@ logger = logging.getLogger(__name__)
 class SyncService:
     """Service for synchronizing data from adapters to local database."""
 
-    def __init__(self, adapter: DataAdapter, db: Database):
+    def __init__(self, adapter: DataAdapter, db: Database, archive_raw: bool = True):
         """Initialize sync service.
 
         Args:
             adapter: Data source adapter
             db: Database instance
+            archive_raw: Persist every upstream response verbatim alongside the
+                mapped records, so fields the typed schema drops stay recoverable
         """
         self.adapter = adapter
         self.db = db
+        self.archive_raw = archive_raw
+
+        set_raw_sink = getattr(adapter, "set_raw_sink", None)
+        if callable(set_raw_sink):
+            set_raw_sink(db.record_raw_payload if archive_raw else None)
 
     async def _iterate_records(self, records: Any) -> AsyncIterator[Any]:
         if hasattr(records, "__aiter__"):
@@ -121,6 +128,23 @@ class SyncService:
                 records = self.adapter.iter_body_measurements(start_date, end_date)
                 async for measurement in self._iterate_records(records):
                     count_outcome(self.db.upsert_body_measurement(measurement))
+            elif data_type == "workout_details":
+                iter_details = getattr(self.adapter, "iter_workout_details", None)
+                if iter_details is None:
+                    # Export mode has no track source; a default sync that lists
+                    # every type must not fail because one source cannot serve one.
+                    logger.info(
+                        "%s exposes no workout detail source; skipping",
+                        type(self.adapter).__name__,
+                    )
+                else:
+                    known = self.db.archived_record_ids("sport.run.detail", user_id)
+                    records = iter_details(start_date, end_date, known)
+                    async for _trackid, newly_archived in self._iterate_records(records):
+                        if newly_archived:
+                            added += 1
+                        else:
+                            skipped += 1
             elif data_type == "heart_rate":
                 records = self.adapter.iter_heart_rate(start_date, end_date)
                 async for sample in self._iterate_records(records):

@@ -1,9 +1,11 @@
 """MCP server implementation for Zepp Life."""
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -12,6 +14,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import CallToolResult, TextContent, Tool
 
 from zepp_life_mcp.adapters.base import DataAdapter
@@ -38,6 +41,9 @@ class RuntimeContext:
     sync_service: SyncService | None = None
     query_service: QueryService | None = None
     connect_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Hosted deployments run sync as a separate CronJob against the same SQLite
+    # file, so the served process must not also write to it.
+    read_only: bool = False
 
 
 context = RuntimeContext()
@@ -73,7 +79,11 @@ async def ensure_connected() -> bool:
             return False
 
         user_id = context.adapter.get_user_id() or "unknown"
-        context.sync_service = SyncService(context.adapter, context.db)
+        context.sync_service = SyncService(
+            context.adapter,
+            context.db,
+            archive_raw=context.config.store_raw_payloads if context.config else True,
+        )
         context.query_service = QueryService(context.db, user_id)
         logger.info("Connected to data source")
         return True
@@ -328,15 +338,34 @@ TOOL_SPECS = (
 )
 
 
+WRITE_TOOLS = frozenset({"sync_data"})
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
+    if context.read_only:
+        return [tool for tool in TOOL_SPECS if tool.name not in WRITE_TOOLS]
     return list(TOOL_SPECS)
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
     try:
-        if name in CONNECTION_REQUIRED_TOOLS and not await ensure_connected():
+        if context.read_only and name in WRITE_TOOLS:
+            result = {
+                "status": "error",
+                "error": f"{name} is disabled: this instance serves the local datastore read-only",
+            }
+            return CallToolResult(
+                content=[TextContent(type="text", text=json.dumps(result))],
+                isError=True,
+            )
+        # Read-only instances answer from the local database and never need the
+        # upstream. Requiring a connection here would let an expired apptoken --
+        # which should only ever break sync -- take down queries whose data is
+        # already on disk.
+        needs_connection = name in CONNECTION_REQUIRED_TOOLS and not context.read_only
+        if needs_connection and not await ensure_connected():
             result = {
                 "status": "error",
                 "error": "Data source connection failed",
@@ -800,7 +829,7 @@ async def close_runtime_context() -> None:
         await result
 
 
-async def main():
+async def _configure_runtime() -> None:
     context.config = load_config()
     context.db = Database(context.config.database_path)
 
@@ -820,13 +849,119 @@ async def main():
                 context.config.timezone,
             )
     if context.adapter and context.adapter.is_connected():
-        context.sync_service = SyncService(context.adapter, context.db)
+        context.sync_service = SyncService(
+            context.adapter,
+            context.db,
+            archive_raw=context.config.store_raw_payloads if context.config else True,
+        )
         context.query_service = QueryService(
             context.db, context.adapter.get_user_id() or "unknown"
         )
     else:
-        context.query_service = QueryService(context.db, "unknown")
+        # No live connection (commonly a lapsed apptoken). The archive is still
+        # on disk, so resolve who it belongs to from the configured adapter or
+        # from the database itself -- otherwise every query filters on "unknown"
+        # and returns empty with status "ok", which reads as "no data" rather
+        # than "misconfigured".
+        user_id = context.adapter.get_user_id() if context.adapter else None
+        if not user_id:
+            user_id = context.db.sole_user_id()
+        if not user_id:
+            logger.warning("No user id available; queries will return nothing")
+        context.query_service = QueryService(context.db, user_id or "unknown")
 
+
+def build_http_app(auth_token: str | None, read_only: bool = False):
+    """ASGI app exposing the MCP streamable-HTTP transport at /mcp.
+
+    /healthz is deliberately outside the auth check so kubelet probes work
+    without handing the cluster a credential.
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Mount, Route
+
+    context.read_only = read_only
+    session_manager = StreamableHTTPSessionManager(app=app, json_response=False)
+
+    async def handle_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    async def healthz(_request):
+        return PlainTextResponse("ok")
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            await _configure_runtime()
+            try:
+                yield
+            finally:
+                await close_runtime_context()
+
+    http_app = Starlette(
+        routes=[Route("/healthz", healthz, methods=["GET"]), Mount("/mcp", app=handle_mcp)],
+        lifespan=lifespan,
+    )
+
+    if not auth_token:
+        logger.warning(
+            "Serving HTTP without an auth token: every caller reaches the full archive"
+        )
+        return http_app
+    return BearerAuthMiddleware(http_app, auth_token, exempt_paths=frozenset({"/healthz"}))
+
+
+class BearerAuthMiddleware:
+    """Require `Authorization: Bearer <token>` on everything but the exempt paths."""
+
+    def __init__(self, app, token: str, exempt_paths: frozenset[str]):
+        self.app = app
+        self.token = token
+        self.exempt_paths = exempt_paths
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") in self.exempt_paths:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        provided = headers.get(b"authorization", b"").decode("utf-8", "replace")
+        # compare_digest keeps the check constant-time; both sides are str.
+        if not secrets.compare_digest(provided, f"Bearer {self.token}"):
+            from starlette.responses import JSONResponse
+
+            response = JSONResponse(
+                {"status": "error", "error": "unauthorized"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+async def main(
+    transport: str = "stdio",
+    host: str = "0.0.0.0",
+    port: int = 8080,
+    auth_token: str | None = None,
+    read_only: bool = False,
+) -> None:
+    if transport == "http":
+        import uvicorn
+
+        http_app = build_http_app(auth_token, read_only=read_only)
+        logger.info("Serving MCP over HTTP at http://%s:%d/mcp", host, port)
+        server = uvicorn.Server(
+            uvicorn.Config(http_app, host=host, port=port, log_level="info", lifespan="on")
+        )
+        await server.serve()
+        return
+
+    context.read_only = read_only
+    await _configure_runtime()
     try:
         async with stdio_server() as (read_stream, write_stream):
             await app.run(

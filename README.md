@@ -23,7 +23,35 @@ The current implementation supports:
 - workouts with readable sport names for known Zepp sport codes
 - weight and body-composition measurements
 
-Cloud coverage can vary by account, region, and upstream endpoint stability. Export mode is the safest option when you need predictable full-history access.
+Cloud coverage can vary by account, region, and upstream endpoint stability.
+
+### Raw payload archive
+
+Every upstream response is also stored verbatim in the `raw_payloads` table (gzipped,
+deduplicated by content hash). The typed tables are deliberately narrow — Zepp returns
+193 fields per workout and the schema keeps 8 — so the archive is what makes a later
+mapping change backfillable from local data rather than requiring a refetch from an
+account that may no longer serve the history.
+
+```python
+from zepp_life_mcp.storage import Database
+
+db = Database("~/.local/share/zepp-life-mcp/zepp_life.db")
+db.raw_payload_stats()                                   # what is archived
+for row in db.read_raw_payloads(endpoint="sport.run.history"):
+    row["payload"]                                       # the original JSON
+```
+
+Set `store_raw_payloads` to `false` in the config to turn this off.
+
+### Upstream row cap
+
+`band_data.json` truncates any response to 500 rows and drops the **most recent** dates
+when it does, while still answering HTTP 200. Sync therefore splits wide ranges into
+windows that stay under the cap; a window that still returns at the cap (a multi-device
+account emits one row per date *per device*) halves itself and retries. A single
+unwindowed request for `2020-01-01`..today was measured returning history that stopped
+two months early.
 
 Cloud connections are lazy: server startup and `tools/list` do not wait for Zepp login. The first data tool establishes one shared connection. If `user_id` is omitted, the adapter attempts to discover the numeric UID from the last 30 days of band summary data and stores it in the system keyring.
 
@@ -70,6 +98,61 @@ zepp-life-mcp doctor
 zepp-life-mcp sync --start-date 2022-01-01 --end-date 2022-12-31
 zepp-life-mcp serve
 ```
+
+## Serving over HTTP
+
+`serve` speaks stdio by default, which is what a local MCP client wants. For a
+hosted instance it can speak the MCP streamable-HTTP transport instead:
+
+```bash
+export ZEPP_MCP_AUTH_TOKEN='<a long random string>'
+zepp-life-mcp serve --transport http --port 8080 --read-only
+```
+
+- the endpoint is `POST /mcp`; clients send `Authorization: Bearer $ZEPP_MCP_AUTH_TOKEN`
+- `/healthz` is outside the auth check so container probes need no credential
+- `--read-only` removes `sync_data`, so a separate scheduled `sync` can own the
+  database and there is exactly one writer
+- the token is read from the environment, never a flag, because an argv secret is
+  visible in `ps` and in a pod spec
+
+Starting without `ZEPP_MCP_AUTH_TOKEN` serves unauthenticated and logs a warning.
+
+### Configuration by environment
+
+Everything needed to run without a writable config directory:
+
+| Variable | Purpose |
+|---|---|
+| `ZEPP_APP_TOKEN` / `ZEPP_APP_TOKEN_FILE` | the Zepp session cookie, inline or from a mounted file |
+| `ZEPP_USER_ID` | optional; saves a discovery request |
+| `ZEPP_MODE`, `ZEPP_REGION`, `ZEPP_TIMEZONE` | config overrides |
+| `ZEPP_DATABASE_PATH`, `ZEPP_EXPORT_PATH` | where the data lives |
+| `ZEPP_STORE_RAW_PAYLOADS` | archive upstream responses verbatim |
+| `ZEPP_MCP_AUTH_TOKEN`, `ZEPP_MCP_TRANSPORT`, `ZEPP_MCP_HOST`, `ZEPP_MCP_PORT`, `ZEPP_MCP_READ_ONLY` | serving |
+
+Environment wins over `config.json`, and the keyring is only consulted when no
+token is supplied — a container has no Secret Service, and that is not an error.
+
+## Container and Helm chart
+
+```bash
+docker build -t zepp-life-mcp .
+docker run --rm -p 8080:8080 -v zepp-data:/data \
+  -e ZEPP_MODE=cloud_session -e ZEPP_APP_TOKEN=... -e ZEPP_MCP_AUTH_TOKEN=... \
+  zepp-life-mcp serve --read-only
+```
+
+`charts/zepp-life-mcp` deploys a read-only HTTP server plus a nightly sync
+CronJob sharing one `ReadWriteOnce` volume. Because that volume is node-local,
+both workloads carry the same `nodeSelector` and the Deployment uses the
+`Recreate` strategy — a second pod cannot attach the same claim. SQLite runs in
+WAL mode so the server keeps reading while the job writes. The PVC is annotated
+`helm.sh/resource-policy: keep`: the archive cannot be re-fetched once Zepp stops
+serving the history.
+
+Credentials come from one Secret (`apptoken`, `bearerToken`); nothing sensitive
+belongs in `values.yaml`.
 
 ## MCP client config
 

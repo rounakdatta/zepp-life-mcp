@@ -51,8 +51,11 @@ def test_load_config_marks_legacy_no_op_keys_as_deprecated(tmp_path, monkeypatch
         schema[key]["deprecated"] is True and schema[key]["x-no-op"] is True
         for key in (
             "auto_sync_on_start",
-            "store_raw_payloads",
             "default_lookback_days",
             "logs_path",
         )
     )
+    # store_raw_payloads is honoured again: it gates the raw_payloads archive.
+    assert loaded.store_raw_payloads is False
+    assert "deprecated" not in schema["store_raw_payloads"]
+    assert "store_raw_payloads" not in caplog.text

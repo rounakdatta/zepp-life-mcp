@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -180,7 +181,7 @@ async def cmd_sync_async(args):
         print(f"❌ Неизвестный режим: {config.mode}")
         sys.exit(1)
 
-    sync_service = SyncService(adapter, db)
+    sync_service = SyncService(adapter, db, archive_raw=config.store_raw_payloads)
     data_types = [args.type] if args.type else adapter.get_available_data_types()
     print(f"Синхронизация {len(data_types)} типов данных...")
     print()
@@ -208,7 +209,23 @@ def main():
     parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="MCP server for Zepp Life data")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    subparsers.add_parser("serve", help="Run MCP server")
+    serve_parser = subparsers.add_parser("serve", help="Run MCP server")
+    serve_parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default=os.environ.get("ZEPP_MCP_TRANSPORT", "stdio"),
+        help="stdio for a local MCP client, http to serve over the network",
+    )
+    serve_parser.add_argument("--host", default=os.environ.get("ZEPP_MCP_HOST", "0.0.0.0"))
+    serve_parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("ZEPP_MCP_PORT", "8080"))
+    )
+    serve_parser.add_argument(
+        "--read-only",
+        action="store_true",
+        default=os.environ.get("ZEPP_MCP_READ_ONLY", "").lower() in ("1", "true", "yes"),
+        help="Disable sync_data so a separate writer owns the database",
+    )
 
     setup_parser = subparsers.add_parser("setup", help="Configure the server")
     setup_parser.add_argument("--mode", choices=["export_file", "cloud_session"], help="Setup mode")
@@ -222,7 +239,14 @@ def main():
     sync_parser = subparsers.add_parser("sync", help="Sync data from source")
     sync_parser.add_argument(
         "--type",
-        choices=["daily_activity", "sleep", "workouts", "body_measurements", "heart_rate"],
+        choices=[
+            "daily_activity",
+            "sleep",
+            "heart_rate",
+            "workouts",
+            "workout_details",
+            "body_measurements",
+        ],
         help="Type of data to sync",
     )
     sync_parser.add_argument("--start-date", help="Start date (YYYY-MM-DD)")
@@ -230,7 +254,17 @@ def main():
 
     args = parser.parse_args()
     if args.command == "serve" or args.command is None:
-        asyncio.run(server_main())
+        # The bearer token is env-only on purpose: an argv secret is visible in
+        # `ps` and in the pod spec.
+        asyncio.run(
+            server_main(
+                transport=getattr(args, "transport", "stdio"),
+                host=getattr(args, "host", "0.0.0.0"),
+                port=getattr(args, "port", 8080),
+                auth_token=os.environ.get("ZEPP_MCP_AUTH_TOKEN") or None,
+                read_only=getattr(args, "read_only", False),
+            )
+        )
     elif args.command == "setup":
         cmd_setup(args)
     elif args.command == "doctor":

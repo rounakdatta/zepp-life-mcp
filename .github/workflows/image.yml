@@ -1,0 +1,99 @@
+name: Build and Push Image + Helm Chart
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Tests before any image is built.
+      - name: Install
+        run: pip install -e '.[dev]'
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      # Cheap and early: a chart that does not lint must never reach the
+      # registry, and a PR should hear about it before anyone reviews it.
+      - name: Lint chart
+        run: helm lint --strict charts/zepp-life-mcp
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # On a pull request this builds without pushing -- the only way to learn
+      # the Dockerfile still works before merge.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Push Helm chart to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+          # On a version tag (v1.2.3) the tag is the authoritative version for
+          # BOTH chart and app. The tag already drives the image tag through
+          # docker/metadata-action, so reading the chart version from a file
+          # would let the two drift silently -- and because the chart's
+          # image.tag defaults to appVersion, --app-version is also what makes
+          # the chart deploy the image this very tag built.
+          # On a plain main push, append +<sha> so every commit produces a
+          # distinct, traceable chart version without requiring a manual bump.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+            helm package charts/zepp-life-mcp --version "$VER" --app-version "$VER"
+          else
+            SHA="${GITHUB_SHA::7}"
+            BASE_VER=$(grep '^version:' charts/zepp-life-mcp/Chart.yaml | awk '{print $2}')
+            helm package charts/zepp-life-mcp --version "${BASE_VER}+${SHA}"
+          fi
+          helm push zepp-life-mcp-*.tgz oci://ghcr.io/rounakdatta/charts
