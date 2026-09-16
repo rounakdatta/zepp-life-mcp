@@ -1,8 +1,12 @@
+import logging
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 MigrationCallback = Callable[[sqlite3.Connection], None]
 
@@ -448,11 +452,73 @@ def _backup_database(db_path: Path, from_version: int, to_version: int) -> Path 
     return backup_path
 
 
-def run_migrations(db_path: Path | str) -> int:
-    """Upgrade a database to the latest schema and return its version."""
+def _read_schema_version(path: Path) -> int | None:
+    """The schema version, read WITHOUT taking a write lock.
+
+    A plain reader can answer "is there anything to do?" while another process
+    is mid-write, which an exclusive transaction cannot.
+    """
+    if not path.exists():
+        return None
+    try:
+        with sqlite3.connect(path, timeout=5) as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
+    except sqlite3.Error:
+        return None
+
+
+def run_migrations(
+    db_path: Path | str,
+    attempts: int = 5,
+    initial_backoff: float = 1.0,
+) -> int:
+    """Upgrade a database to the latest schema and return its version.
+
+    Every process that opens the database calls this, including the server on
+    each boot. It used to open an exclusive transaction unconditionally, so a
+    boot with *nothing to migrate* still contended with a running sync job and
+    died with "database is locked" after the 30-second timeout -- which, with a
+    frequent sync schedule, is an unbreakable CrashLoopBackOff.
+
+    Two changes: the common case (schema already current) is answered by a
+    reader that cannot be blocked by a writer, and a genuine migration retries
+    with backoff instead of failing on the first contended attempt.
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    version = _read_schema_version(path)
+    if version == LATEST_SCHEMA_VERSION:
+        return version
+
+    delay = initial_backoff
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _apply_migrations(path)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last_error = exc
+            if attempt == attempts:
+                break
+            logger.warning(
+                "Database busy while migrating (attempt %d/%d); retrying in %.0fs",
+                attempt,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+            delay *= 2
+            # Another process may have finished the migration while we waited.
+            if _read_schema_version(path) == LATEST_SCHEMA_VERSION:
+                return LATEST_SCHEMA_VERSION
+
+    assert last_error is not None
+    raise last_error
+
+
+def _apply_migrations(path: Path) -> int:
     with sqlite3.connect(path, isolation_level=None, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:

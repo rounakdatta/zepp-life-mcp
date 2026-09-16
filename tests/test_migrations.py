@@ -1,8 +1,12 @@
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+import pytest
+
 from zepp_life_mcp.storage import Database
+from zepp_life_mcp.storage import migrations as migrations_module
 from zepp_life_mcp.storage.migrations import LATEST_SCHEMA_VERSION, MIGRATIONS, run_migrations
 
 
@@ -307,3 +311,68 @@ def test_cloud_identity_migration_rekeys_existing_rows_without_data_loss(tmp_pat
         ],
     }
     assert steps == 321
+
+
+def test_boot_with_nothing_to_migrate_does_not_contend_with_a_writer(tmp_path):
+    """Regression: this was an unbreakable CrashLoopBackOff.
+
+    Every process calls run_migrations on open, including the server on each
+    boot. It opened an exclusive transaction unconditionally, so a boot with
+    nothing to migrate still fought a running sync job and died with "database
+    is locked" after 30 seconds. With a frequent sync schedule the server never
+    got a clean window and crash-looped indefinitely.
+    """
+    db_path = tmp_path / "zepp.db"
+    Database(db_path)  # bring fully up to date, as a deployed file already is
+
+    holder = sqlite3.connect(db_path, timeout=30)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO sync_state (source_type,user_id,data_type) VALUES ('x','y','z')")
+    try:
+        started = time.monotonic()
+        version = run_migrations(db_path)
+        elapsed = time.monotonic() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert version == LATEST_SCHEMA_VERSION
+    assert elapsed < 5, "an up-to-date boot must not wait on a writer at all"
+
+
+def test_a_real_migration_retries_instead_of_failing_on_first_contention(tmp_path, monkeypatch):
+    """When there IS work to do, contention should be waited out, not fatal."""
+    db_path = tmp_path / "zepp.db"
+    _create_v010_database(db_path)
+
+    calls = {"n": 0}
+    real = migrations_module._apply_migrations
+
+    def flaky(path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(path)
+
+    monkeypatch.setattr(migrations_module, "_apply_migrations", flaky)
+    version = run_migrations(db_path, attempts=3, initial_backoff=0.01)
+
+    assert calls["n"] == 2, "it should have retried exactly once"
+    assert version == LATEST_SCHEMA_VERSION
+
+
+def test_a_non_lock_error_is_not_retried(tmp_path, monkeypatch):
+    """A corrupt database is not a busy one; retrying would just hide it."""
+    db_path = tmp_path / "zepp.db"
+    _create_v010_database(db_path)
+
+    calls = {"n": 0}
+
+    def broken(path):
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: everything")
+
+    monkeypatch.setattr(migrations_module, "_apply_migrations", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        run_migrations(db_path, attempts=4, initial_backoff=0.01)
+    assert calls["n"] == 1

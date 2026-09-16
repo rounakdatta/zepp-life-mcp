@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+
+- **Startup could crash-loop forever against a busy database.** Every process
+  runs the migration check when it opens the database, including the server on
+  each boot, and it opened an *exclusive* transaction unconditionally -- even
+  when the schema was already current and there was nothing to do. A sync job
+  holding the write lock therefore made the server fail to start with
+  `database is locked` after the 30-second timeout, and with a frequent sync
+  schedule it never got a clean window: an unbreakable CrashLoopBackOff.
+  Observed in production while backfilling on a 10-minute schedule.
+
+  The common case is now answered by a plain reader, which a writer cannot
+  block, and returns in microseconds. A genuine migration retries with backoff
+  and re-checks whether another process completed it in the meantime. A
+  non-lock error is still fatal on the first attempt -- a corrupt database is
+  not a busy one, and retrying would only hide it.
+
 ## 0.5.0
 
 Clears the backlog of things flagged in review and never actually fixed.
