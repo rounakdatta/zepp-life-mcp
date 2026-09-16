@@ -306,3 +306,83 @@ async def test_export_mode_skips_workout_details_instead_of_failing(tmp_path):
         "workout_details", start_date="2024-01-01", end_date="2024-12-31"
     )
     assert result["added"] == 0
+
+
+async def test_read_only_serves_queries_without_an_upstream_connection(monkeypatch, tmp_path):
+    """An expired apptoken must break sync, not queries whose data is on disk."""
+    from zepp_life_mcp import server
+
+    class DeadAdapter:
+        """Configured but unable to reach Zepp, as with a lapsed token."""
+
+        def is_connected(self):
+            return False
+
+        def connect(self):
+            return False
+
+        def get_user_id(self):
+            return "u1"
+
+    from zepp_life_mcp.services.query_service import QueryService
+
+    db = Database(tmp_path / "ro.db")
+    monkeypatch.setattr(server.context, "db", db)
+    monkeypatch.setattr(server.context, "adapter", cast(Any, DeadAdapter()))
+    monkeypatch.setattr(server.context, "query_service", QueryService(db, "u1"))
+    monkeypatch.setattr(server.context, "read_only", True)
+
+    tools = [tool.name for tool in await server.list_tools()]
+    assert "sync_data" not in tools, "read-only must not advertise a writer tool"
+    assert "query_workouts" in tools
+
+    result = await server.call_tool("sync_data", {})
+    assert result.isError
+    assert "read-only" in result.content[0].text
+
+    # a query still runs: it reads SQLite, never the adapter
+    result = await server.call_tool(
+        "query_workouts", {"start_date": "2024-01-01", "end_date": "2024-12-31"}
+    )
+    assert not result.isError
+
+
+async def test_archive_owner_is_resolved_without_a_connection(tmp_path):
+    """Regression: a lapsed token made every query return empty with status ok.
+
+    QueryService was constructed with user_id "unknown" whenever the adapter was
+    not connected, so it filtered against a user that owns no rows. Empty results
+    and a success status read as "you have no data", not "this is misconfigured".
+    """
+    from zepp_life_mcp.models import DailyActivity
+
+    db = Database(tmp_path / "owner.db")
+    assert db.sole_user_id() is None
+
+    db.upsert_daily_activity(
+        DailyActivity(
+            id="a1",
+            provider="zepp_life",
+            source_type="cloud_session",
+            user_id="3308073311",
+            date="2026-09-01",
+            steps=100,
+            distance_m=200,
+            active_kcal=30,
+        )
+    )
+    assert db.sole_user_id() == "3308073311"
+
+    db.upsert_daily_activity(
+        DailyActivity(
+            id="b1",
+            provider="zepp_life",
+            source_type="cloud_session",
+            user_id="other-user",
+            date="2026-09-01",
+            steps=100,
+            distance_m=200,
+            active_kcal=30,
+        )
+    )
+    assert db.sole_user_id() is None, "ambiguous ownership must not be guessed"

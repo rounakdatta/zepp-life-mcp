@@ -319,6 +319,25 @@ class Database:
             conn.commit()
             return cursor.rowcount > 0
 
+    def sole_user_id(self) -> str | None:
+        """The one user_id present in this database, or None if 0 or many.
+
+        A served instance must be able to answer from the archive without a
+        working upstream connection, which is the only other way to learn whose
+        data it holds.
+        """
+        tables = (
+            "daily_activity",
+            "sleep_sessions",
+            "workouts",
+            "body_measurements",
+            "heart_rate_samples",
+        )
+        union = " UNION ".join(f"SELECT DISTINCT user_id FROM {table}" for table in tables)
+        with self._get_connection() as conn:
+            rows = conn.execute(f"SELECT DISTINCT user_id FROM ({union}) LIMIT 2").fetchall()
+        return str(rows[0]["user_id"]) if len(rows) == 1 else None
+
     def archived_record_ids(self, endpoint: str, user_id: str) -> set[str]:
         """Record IDs already archived for a per-record endpoint.
 

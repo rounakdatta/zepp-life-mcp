@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -65,7 +66,12 @@ class Config(BaseModel):
 
 def get_config_dir() -> Path:
     config_dir = Path(user_config_dir("zepp-life-mcp"))
-    config_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # A read-only or absent config dir is normal for a fully env-configured
+        # container. Resolving the path must still work; only writing may fail.
+        logger.debug("Config directory %s is not writable: %s", config_dir, exc)
     return config_dir
 
 
@@ -73,11 +79,43 @@ def get_config_path() -> Path:
     return get_config_dir() / "config.json"
 
 
+# Env overrides so a deployed instance is configured entirely by its pod spec,
+# with no writable config directory and nothing to drift between restarts.
+ENV_OVERRIDES = {
+    "ZEPP_MODE": "mode",
+    "ZEPP_REGION": "region",
+    "ZEPP_TIMEZONE": "timezone",
+    "ZEPP_DATABASE_PATH": "database_path",
+    "ZEPP_EXPORT_PATH": "export_path",
+}
+
+
+def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
+    for env_name, field_name in ENV_OVERRIDES.items():
+        value = os.environ.get(env_name)
+        if not value:
+            continue
+        if field_name in ("database_path", "export_path"):
+            data[field_name] = Path(value)
+        else:
+            data[field_name] = value
+
+    store_raw = os.environ.get("ZEPP_STORE_RAW_PAYLOADS")
+    if store_raw:
+        data["store_raw_payloads"] = store_raw.lower() in ("1", "true", "yes")
+    return data
+
+
 def load_config() -> Config:
     config_path = get_config_path()
     if not config_path.exists():
-        config = Config()
-        save_config(config)
+        config = Config(**_apply_env_overrides({}))
+        # Only persist when there is somewhere to persist to; a read-only
+        # config dir is normal in a container and must not be fatal.
+        try:
+            save_config(config)
+        except OSError as exc:
+            logger.warning("Could not write %s: %s", config_path, exc)
         return config
 
     with open(config_path, encoding="utf-8") as f:
@@ -97,7 +135,7 @@ def load_config() -> Config:
     if "export_path" in data and isinstance(data["export_path"], str):
         data["export_path"] = Path(data["export_path"]) if data["export_path"] else None
 
-    return Config(**data)
+    return Config(**_apply_env_overrides(data))
 
 
 def save_config(config: Config) -> None:

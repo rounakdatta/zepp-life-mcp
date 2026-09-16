@@ -1,8 +1,10 @@
 """Authentication helpers for Zepp Life cloud API."""
 
 import logging
+import os
 import webbrowser
 from contextlib import suppress
+from pathlib import Path
 
 import keyring
 from keyring.errors import PasswordDeleteError
@@ -12,24 +14,65 @@ logger = logging.getLogger(__name__)
 SERVICE_NAME = "zepp-life-mcp"
 ACCOUNT_NAME = "zepp_auth"
 
+# A container has no Secret Service, so keyring raises there and the old
+# load_token() swallowed it and reported "not configured". These let the
+# credential arrive from a k8s Secret instead, as an env var or a mounted file.
+ENV_TOKEN = "ZEPP_APP_TOKEN"
+ENV_TOKEN_FILE = "ZEPP_APP_TOKEN_FILE"
+ENV_USER_ID = "ZEPP_USER_ID"
+
+
+def _credentials_from_environment() -> tuple[str | None, str | None]:
+    token = os.environ.get(ENV_TOKEN) or None
+
+    token_file = os.environ.get(ENV_TOKEN_FILE)
+    if not token and token_file:
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip() or None
+        except OSError as exc:
+            # Loud: a mounted Secret that cannot be read is a deploy fault, and
+            # falling through to "not configured" would hide it.
+            logger.error("Could not read %s=%s: %s", ENV_TOKEN_FILE, token_file, exc)
+
+    return token, os.environ.get(ENV_USER_ID) or None
+
 
 def save_token(token: str, user_id: str | None = None) -> None:
-    keyring.set_password(SERVICE_NAME, f"{ACCOUNT_NAME}_token", token)
+    _set_password(f"{ACCOUNT_NAME}_token", token)
     if user_id:
         save_user_id(user_id)
 
 
 def save_user_id(user_id: str) -> None:
-    keyring.set_password(SERVICE_NAME, f"{ACCOUNT_NAME}_user_id", user_id)
+    _set_password(f"{ACCOUNT_NAME}_user_id", user_id)
+
+
+def _set_password(key: str, value: str) -> None:
+    try:
+        keyring.set_password(SERVICE_NAME, key, value)
+    except Exception as exc:
+        # Discovering the UID must not crash a containerised run that was
+        # configured by environment in the first place.
+        logger.warning("Keyring unavailable, not persisting %s: %s", key, exc)
 
 
 def load_token() -> tuple[str | None, str | None]:
-    try:
-        token = keyring.get_password(SERVICE_NAME, f"{ACCOUNT_NAME}_token")
-        user_id = keyring.get_password(SERVICE_NAME, f"{ACCOUNT_NAME}_user_id")
+    """Resolve credentials from the environment first, then the system keyring.
+
+    Environment wins so a deployed instance is configured by exactly one thing
+    and never picks up a stale keyring entry from the image or the host.
+    """
+    token, user_id = _credentials_from_environment()
+    if token:
         return token, user_id
-    except Exception:
-        return None, None
+
+    try:
+        keyring_token = keyring.get_password(SERVICE_NAME, f"{ACCOUNT_NAME}_token")
+        keyring_user_id = keyring.get_password(SERVICE_NAME, f"{ACCOUNT_NAME}_user_id")
+        return keyring_token, user_id or keyring_user_id
+    except Exception as exc:
+        logger.debug("Keyring unavailable: %s", exc)
+        return None, user_id
 
 
 def delete_token() -> None:
