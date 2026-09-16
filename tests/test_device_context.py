@@ -360,3 +360,32 @@ def test_api_host_is_the_real_knob_and_region_is_not():
         app_token="t", user_id="u1", api_host="https://api-mifit-de2.huami.com"
     )
     assert override.api_host == "https://api-mifit-de2.huami.com"
+
+
+async def test_get_profile_answers_without_a_live_connection(tmp_path, monkeypatch):
+    """Regression: the only tool that could not answer on a read-only instance.
+
+    It demanded `adapter.is_connected()` before returning anything, even though
+    the user id and timezone live in the local database -- so on the deployment's
+    actual configuration it returned an error instead of a profile.
+    """
+    from zepp_life_mcp import server
+    from zepp_life_mcp.models import DailyActivity
+
+    db = Database(tmp_path / "prof.db")
+    db.upsert_daily_activity(DailyActivity(
+        id="a", provider="zepp_life", source_type="cloud_session", user_id="3308073311",
+        date="2026-09-01", steps=1, distance_m=1, active_kcal=1))
+
+    class Disconnected:
+        def is_connected(self): return False
+        def get_user_id(self): return None
+
+    monkeypatch.setattr(server.context, "db", db)
+    monkeypatch.setattr(server.context, "adapter", cast(Any, Disconnected()))
+    monkeypatch.setattr(server.context, "read_only", True)
+
+    out = await server._handle_get_profile({"include_devices": True})
+    assert out["status"] == "ok"
+    assert out["data"]["profile"]["user_id"] == "3308073311"
+    assert out["data"]["profile"]["devices"] == [], "devices need upstream; the rest does not"

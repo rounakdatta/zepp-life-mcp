@@ -548,13 +548,20 @@ async def _handle_sync_data(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _handle_get_profile(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not context.adapter or not context.adapter.is_connected():
+    # Most of a profile is local. Requiring a live connection made this the one
+    # tool that could not answer at all on a read-only instance, which is the
+    # configuration the deployment actually runs -- and it failed even though
+    # the user id and timezone were sitting in the database.
+    user_id = None
+    if context.adapter:
+        user_id = context.adapter.get_user_id()
+    if not user_id and context.db:
+        user_id = context.db.sole_user_id()
+    if not user_id:
         return {
             "status": "error",
-            "error": "Not connected to data source",
+            "error": "No user id available; sync at least once first",
         }
-
-    user_id = context.adapter.get_user_id() or "unknown"
 
     profile = {
         "user_id": user_id,
@@ -564,7 +571,11 @@ async def _handle_get_profile(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
     if arguments.get("include_devices"):
-        get_devices = getattr(context.adapter, "get_devices", None)
+        # Devices are the one part that genuinely needs the upstream; without it
+        # the rest of the profile is still returned rather than the whole call
+        # failing.
+        connected = bool(context.adapter and context.adapter.is_connected())
+        get_devices = getattr(context.adapter, "get_devices", None) if connected else None
         if callable(get_devices):
             result = get_devices()
             if inspect.isawaitable(result):

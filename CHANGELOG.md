@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.2
+
+### Fixed
+
+- `get_profile` returned `Not connected to data source` on a **read-only**
+  instance -- the configuration the deployment actually runs -- even though the
+  user id and timezone it reports live in the local database. It was the one
+  tool that could not answer at all once the endpoint stopped holding a live
+  cloud session. It now answers from local data, and only the device list, which
+  genuinely needs the upstream, is omitted when there is no connection.
+
 ## 0.5.1
 
 ### Fixed
