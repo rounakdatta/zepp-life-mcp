@@ -7,6 +7,11 @@ metadata:
     {{- include "zepp-life-mcp.labels" . | nindent 4 }}
 spec:
   schedule: {{ .Values.sync.schedule | quote }}
+  {{- if .Values.sync.timeZone }}
+  # Without this, Kubernetes reads the schedule in UTC, which silently means a
+  # different wall-clock hour than whoever wrote it intended.
+  timeZone: {{ .Values.sync.timeZone | quote }}
+  {{- end }}
   concurrencyPolicy: {{ .Values.sync.concurrencyPolicy }}
   successfulJobsHistoryLimit: {{ .Values.sync.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ .Values.sync.failedJobsHistoryLimit }}

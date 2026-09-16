@@ -49,6 +49,10 @@ sync:
   # Nightly. The band uploads on its own schedule, so there is nothing to gain
   # from syncing more often than the phone does.
   schedule: "17 3 * * *"
+  # The IANA zone the schedule is written in. Leave empty and Kubernetes uses
+  # UTC, so "03:17" means 03:17 UTC regardless of what the comment beside it
+  # says. Requires Kubernetes 1.27+.
+  timeZone: ""
   # Empty means every type the adapter offers, which includes workout_details.
   dataTypes: []
   # The full-history floor. Windowing makes a wide range safe, and everything

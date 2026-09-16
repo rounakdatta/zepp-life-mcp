@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2
+
+### Fixed
+
+- The sync CronJob's schedule is now interpreted in a configurable timezone via
+  `sync.timeZone`. Kubernetes reads a cron schedule in UTC unless `spec.timeZone`
+  is set, so a schedule written as a local time ran hours away from where it was
+  meant to, with nothing in the manifest to show the discrepancy.
+
 ## 0.3.1
 
 ### Fixed
