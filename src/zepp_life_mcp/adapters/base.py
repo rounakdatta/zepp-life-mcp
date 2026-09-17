@@ -84,8 +84,15 @@ def parse_sleep_summary(sleep_data: dict[str, Any]) -> SleepMetrics:
             wake_count += 1
 
     if not stages:
+        # No per-stage breakdown, so fall back to the summary totals. `dt` is REM:
+        # on a night that does carry stages, dp + lt + dt + wk reconstructs the
+        # session length exactly, which is what identifies it. Omitting it used to
+        # report REM as zero and understate the night by however long REM was.
+        # Latent rather than active on the archives seen so far -- every
+        # stage-less night there is empty -- but silent when it does bite.
         totals["deep"] = _minutes(sleep_data.get("dp"))
         totals["light"] = _minutes(sleep_data.get("lt"))
+        totals["rem"] = _minutes(sleep_data.get("dt"))
         totals["awake"] = _minutes(sleep_data.get("wk"))
 
     asleep = totals["deep"] + totals["light"] + totals["rem"]

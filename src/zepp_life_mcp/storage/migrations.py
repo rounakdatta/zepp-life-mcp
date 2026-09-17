@@ -405,6 +405,31 @@ def _add_workout_effort(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE workouts ADD COLUMN training_effect REAL")
 
 
+def _drop_impossible_heart_rate(conn: sqlite3.Connection) -> None:
+    """Remove heart-rate samples dated outside the device's own activity record.
+
+    Upstream occasionally files a sleep block under one day while its timestamps
+    point a year elsewhere. The sleep path rejected those records; the heart-rate
+    path did not, so the archive held resting samples predating the device and
+    get_data_coverage reported a first_date a year earlier than every other type.
+
+    Deliberately conservative: only rows outside the span of that user's own
+    daily_activity go, and only for users who have daily_activity at all. The
+    verbatim payloads these were derived from remain in raw_payloads, so nothing
+    is actually lost -- this removes a derived row that was known to be wrong.
+    """
+    conn.execute(
+        """
+        DELETE FROM heart_rate_samples
+        WHERE user_id IN (SELECT DISTINCT user_id FROM daily_activity)
+          AND local_date NOT BETWEEN
+              (SELECT MIN(date) FROM daily_activity d WHERE d.user_id = heart_rate_samples.user_id)
+              AND
+              (SELECT MAX(date) FROM daily_activity d WHERE d.user_id = heart_rate_samples.user_id)
+        """
+    )
+
+
 MIGRATIONS = (
     Migration(version=1, apply=_create_baseline_schema),
     Migration(version=2, apply=_add_device_keys, destructive=True),
@@ -417,6 +442,7 @@ MIGRATIONS = (
     Migration(version=9, apply=_add_device_context),
     Migration(version=10, apply=_add_workout_place),
     Migration(version=11, apply=_add_workout_effort),
+    Migration(version=12, apply=_drop_impossible_heart_rate, destructive=True),
 )
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1].version
 

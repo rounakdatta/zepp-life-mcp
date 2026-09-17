@@ -389,3 +389,45 @@ async def test_get_profile_answers_without_a_live_connection(tmp_path, monkeypat
     assert out["status"] == "ok"
     assert out["data"]["profile"]["user_id"] == "3308073311"
     assert out["data"]["profile"]["devices"] == [], "devices need upstream; the rest does not"
+
+
+async def test_resting_heart_rate_outside_the_window_is_discarded():
+    """Regression: samples landed in the archive dated before the device existed.
+
+    Upstream files the odd sleep block under one day while its timestamps point a
+    year elsewhere. iter_sleep_sessions rejects those, but the heart-rate path
+    needs only `rhr` and `ed`, so it accepted them -- and get_data_coverage then
+    reported heart_rate starting a year before every other data type.
+    """
+    stale = int(datetime(2024, 2, 18, 2, 0, tzinfo=UTC).timestamp())
+    days = [{
+        "date_time": "2026-07-15",
+        "summary": {"tz": "19800", "stp": {"ttl": 1, "dis": 1, "cal": 1},
+                    "slp": {"st": stale, "ed": stale, "rhr": 52}},
+    }]
+    samples = [s async for s in _adapter(days).iter_heart_rate("2026-07-15", "2026-07-15")]
+    assert samples == [], "a 2024 timestamp cannot come out of a 2026 window"
+
+
+async def test_a_resting_sample_inside_the_window_still_arrives():
+    end = int(datetime(2026, 7, 15, 2, 0, tzinfo=UTC).timestamp())
+    days = [{
+        "date_time": "2026-07-15",
+        "summary": {"tz": "19800", "stp": {"ttl": 1, "dis": 1, "cal": 1},
+                    "slp": {"st": end - 25000, "ed": end, "rhr": 48}},
+    }]
+    samples = [s async for s in _adapter(days).iter_heart_rate("2026-07-15", "2026-07-15")]
+    resting = [s for s in samples if s.sample_type == "resting"]
+    assert len(resting) == 1
+    assert resting[0].bpm == 48
+
+
+def test_rem_survives_the_no_stage_fallback():
+    """`dt` is REM: on a night that has stages, dp+lt+dt+wk reconstructs the session."""
+    from zepp_life_mcp.adapters.base import parse_sleep_summary
+
+    metrics = parse_sleep_summary({"dp": 28, "lt": 258, "dt": 109, "wk": 16})
+    assert metrics.rem_minutes == 109, "REM was reported as zero before"
+    assert metrics.deep_minutes == 28
+    assert metrics.time_asleep_minutes == 28 + 258 + 109
+    assert metrics.duration_minutes == 411, "which is exactly the session length"

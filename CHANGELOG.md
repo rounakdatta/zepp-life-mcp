@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.3
+
+### Fixed
+
+- **Resting heart rate could be filed a year outside the window it came from.**
+  Upstream occasionally records a sleep block under one day while its timestamps
+  point somewhere else entirely -- three such days exist in a real archive, with
+  2024 timestamps on 2025 records. `iter_sleep_sessions` rejects them, but the
+  heart-rate path needs only `rhr` and `ed` and so accepted them, putting
+  resting samples in the archive before the device existed and making
+  `get_data_coverage` report `heart_rate` starting a year before every other
+  data type. A sample derived from a window must now fall inside it.
+- A migration removes samples already stored outside the span of that user's own
+  daily activity. Conservative by design: only users who have daily activity at
+  all are touched, and the verbatim payloads remain in `raw_payloads`, so this
+  drops a derived row that was known to be wrong rather than losing anything.
+- **`dt` is REM and the no-stage fallback ignored it**, reporting REM as zero and
+  understating those nights by however long REM was. On a night that does carry
+  stages, `dp + lt + dt + wk` reconstructs the session length exactly, which is
+  what identifies the field. Latent rather than active on the archives seen so
+  far -- every stage-less night there is empty -- but silent when it does bite.
+
 ## 0.5.2
 
 ### Fixed

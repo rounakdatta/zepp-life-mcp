@@ -766,7 +766,26 @@ class CloudSessionAdapter(DataAdapter):
                     continue
                 if resting_bpm <= 0 or end_ts <= 0:
                     continue
+
                 timestamp = self._utc_from_timestamp(end_ts)
+                sample_date = self._local_date(timestamp)
+                # Upstream occasionally files a sleep block under one day while
+                # its timestamps point a YEAR elsewhere. iter_sleep_sessions
+                # rejects those records, but this path only needs `rhr` and `ed`
+                # and so accepted them -- putting resting samples in the archive
+                # before the device existed and making get_data_coverage report a
+                # first_date a year earlier than every other data type. A sample
+                # derived from a window must fall inside that window.
+                if sample_date < start_date or sample_date > end_date:
+                    logger.warning(
+                        "Discarding resting heart rate for %s: timestamp resolves to %s, "
+                        "outside the requested %s..%s",
+                        date_str,
+                        sample_date,
+                        start_date,
+                        end_date,
+                    )
+                    continue
                 yield HeartRateSample(
                     id=f"cloud_rhr_{self.user_id}_{date_str}",
                     provider="zepp_life",
@@ -777,7 +796,7 @@ class CloudSessionAdapter(DataAdapter):
                     collected_at=None,
                     timezone=self.timezone,
                     timestamp=timestamp,
-                    local_date=self._local_date(timestamp),
+                    local_date=sample_date,
                     bpm=resting_bpm,
                     sample_type="resting",
                 )

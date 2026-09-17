@@ -1,6 +1,7 @@
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from threading import Barrier
 
 import pytest
@@ -376,3 +377,50 @@ def test_a_non_lock_error_is_not_retried(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         run_migrations(db_path, attempts=4, initial_backoff=0.01)
     assert calls["n"] == 1
+
+
+def test_heart_rate_outside_the_activity_span_is_cleaned_up(tmp_path):
+    """The two stale rows made get_data_coverage report a first_date a year early."""
+    db_path = tmp_path / "zepp.db"
+    db = Database(db_path)
+    from zepp_life_mcp.models import DailyActivity, HeartRateSample
+
+    for day in ("2025-02-24", "2026-09-15"):
+        db.upsert_daily_activity(DailyActivity(
+            id=f"a{day}", provider="zepp_life", source_type="cloud_session", user_id="u1",
+            date=day, steps=1, distance_m=1, active_kcal=1))
+    for tag, local_date, ts in (
+        ("stale", "2024-02-18", "2024-02-18T02:00:00+00:00"),
+        ("good", "2026-07-15", "2026-07-15T02:00:00+00:00"),
+    ):
+        db.upsert_heart_rate_sample(HeartRateSample(
+            id=tag, provider="zepp_life", source_type="cloud_session", user_id="u1",
+            timestamp=datetime.fromisoformat(ts), local_date=local_date,
+            bpm=50, sample_type="resting"))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 11")
+    run_migrations(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        rows = [r[0] for r in conn.execute("SELECT local_date FROM heart_rate_samples")]
+    assert rows == ["2026-07-15"], "only the impossible row should go"
+
+
+def test_cleanup_leaves_users_with_no_activity_alone(tmp_path):
+    """Without a daily_activity span there is nothing to judge against."""
+    db_path = tmp_path / "zepp.db"
+    db = Database(db_path)
+    from zepp_life_mcp.models import HeartRateSample
+
+    db.upsert_heart_rate_sample(HeartRateSample(
+        id="x", provider="zepp_life", source_type="cloud_session", user_id="lonely",
+        timestamp=datetime.fromisoformat("2024-02-18T02:00:00+00:00"),
+        local_date="2024-02-18", bpm=50, sample_type="resting"))
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA user_version = 11")
+    run_migrations(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM heart_rate_samples").fetchone()[0] == 1
