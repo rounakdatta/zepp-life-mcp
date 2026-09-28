@@ -2,19 +2,24 @@
 
 ## 0.5.4
 
+The goal of this release is a sync that can run every few minutes without ever
+leaving a gap, however late or out of order the phone uploads.
+
 ### Added
 
-- `sync --lookback-days N`, and an optional daily deep CronJob in the chart
-  (`sync.deep`, 14 days by default). The regular pass covers the usual overnight
-  upload lag; the deep one catches data that reaches Zepp days late -- the phone
-  offline, or the app not syncing in the background -- and, when it adds rows at
-  all, is evidence the regular pass missed something.
+- `sync --lookback-days N`, and an optional deep CronJob in the chart
+  (`sync.deep`, 14 days by default). The regular pass covers the usual upload
+  lag; the deep one re-reads a wider window for data that arrives out of order or
+  that Zepp reprocesses later, and when it adds rows at all, that is evidence the
+  regular pass missed something.
+- `zepp-life-mcp snapshot --to PATH`: a consistent, self-contained copy of the
+  database via SQLite's online backup API, checked for integrity and renamed into
+  place. A file-level backup of the live file can be torn by a concurrent write,
+  which matters once a sync writes every few minutes.
+- `sync.startingDeadlineSeconds` in the chart, to skip a run that could not start
+  on time instead of starting it late.
 
 ### Fixed
-
-- **`sync` exited 0 when a data type failed**, so the Job read Complete while, say,
-  a lapsed token meant nothing was being collected. It now exits 1. The failed
-  type still keeps its cursor, so the next run retries the same range.
 
 - **A resumed sync never re-read a day that finished uploading late.** Each pass
   started exactly at the cursor the previous one stored, so whatever the phone
@@ -22,8 +27,16 @@
   the next morning -- was skipped for good. A resumed pass now starts
   `CURSOR_LOOKBACK_DAYS` (two) before the cursor. Upserts are idempotent and an
   identical payload is archived once, so the overlap costs a few requests, not
-  rows. This is also what makes a frequent schedule safe: a job every few minutes
-  moves the cursor to today within minutes of midnight.
+  rows.
+- **An offline stretch longer than the lookback was lost.** The cursor records
+  when a pass ran, not how far the data had got, so it kept moving while the
+  phone was offline and the days it later uploaded fell behind any fixed window.
+  A pass now also starts no later than the day before the latest day with band
+  data in the archive (capped at 30 days back), which stays put while nothing
+  arrives.
+- **`sync` exited 0 when a data type failed**, so the Job read Complete while, say,
+  a lapsed token meant nothing was being collected. It now exits 1. The failed
+  type still keeps its cursor, so the next run retries the same range.
 - **"Today" was the host's date, not the account's.** `sync` defaulted `end_date`
   to `date.today()`, which in a UTC container is still yesterday for the first
   five and a half hours of an IST day, so no pass in that gap could see the
