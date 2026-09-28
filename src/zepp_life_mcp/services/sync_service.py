@@ -5,11 +5,19 @@ import logging
 from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from zepp_life_mcp.adapters.base import DataAdapter
 from zepp_life_mcp.storage import Database, UpsertOutcome
 
 logger = logging.getLogger(__name__)
+
+# How far before the stored cursor a resumed sync starts reading. The band
+# uploads on the phone's schedule, so the last hours of a day can reach Zepp
+# after a run has already moved the cursor past that day; resuming exactly at
+# the cursor skips them for good. Re-reading is cheap: upserts are idempotent
+# and an identical payload is never archived twice.
+CURSOR_LOOKBACK_DAYS = 2
 
 
 class SyncService:
@@ -32,6 +40,18 @@ class SyncService:
         if callable(set_raw_sink):
             set_raw_sink(db.record_raw_payload if archive_raw else None)
 
+    def _today(self) -> date:
+        """Today in the account's timezone rather than the host's.
+
+        A container clock runs in UTC, where it is still yesterday for the first
+        hours of an IST day. Zepp files data under the band's local date, so a
+        run in that gap could not see the morning that had just been uploaded.
+        """
+        zone = getattr(self.adapter, "timezone", None)
+        if isinstance(zone, str) and zone:
+            return datetime.now(ZoneInfo(zone)).date()
+        return date.today()
+
     async def _iterate_records(self, records: Any) -> AsyncIterator[Any]:
         if hasattr(records, "__aiter__"):
             async for record in records:
@@ -52,8 +72,11 @@ class SyncService:
 
         Args:
             data_type: Type of data to sync (daily_activity, sleep, workouts, body_measurements)
-            start_date: Start date (YYYY-MM-DD), defaults to 30 days ago
-            end_date: End date (YYYY-MM-DD), defaults to today
+            start_date: Start date (YYYY-MM-DD), defaults to CURSOR_LOOKBACK_DAYS
+                before the stored cursor; without one, all history for the cloud
+                and 30 days for exports
+            end_date: End date (YYYY-MM-DD), defaults to today in the adapter's
+                timezone
             force_full: Force full sync ignoring last sync state
 
         Returns:
@@ -78,10 +101,13 @@ class SyncService:
                 cursor_date = state.get("cursor_date")
 
         if not end_date:
-            end_date = date.today().isoformat()
+            end_date = self._today().isoformat()
         if not start_date:
             if cursor_date:
-                start_date = cursor_date
+                resume = date.fromisoformat(cursor_date) - timedelta(days=CURSOR_LOOKBACK_DAYS)
+                # A cursor can sit past end_date (an earlier run given a later
+                # --end-date); clamping keeps that from failing every run after.
+                start_date = min(resume, date.fromisoformat(end_date)).isoformat()
             elif self.adapter.__class__.__name__ == "CloudSessionAdapter":
                 start_date = "2020-01-01"
             else:

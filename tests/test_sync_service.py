@@ -1,8 +1,11 @@
+from datetime import UTC, datetime
+
 import pytest
 
 from zepp_life_mcp import server
 from zepp_life_mcp.adapters.base import DataAdapter
 from zepp_life_mcp.models import DailyActivity
+from zepp_life_mcp.services import sync_service
 from zepp_life_mcp.services.sync_service import SyncService
 from zepp_life_mcp.storage import Database
 
@@ -104,14 +107,88 @@ async def test_daily_activity_uses_scoped_logical_cursor_for_each_user(tmp_path)
     await SyncService(first_adapter, database).sync_data_type("daily_activity", end_date="2024-02-02")
     await SyncService(second_adapter, database).sync_data_type("daily_activity", end_date="2024-03-02")
 
-    assert first_adapter.requested_ranges[-1] == ("2024-01-31", "2024-02-02")
-    assert second_adapter.requested_ranges[-1] == ("2024-02-29", "2024-03-02")
+    assert first_adapter.requested_ranges[-1] == ("2024-01-29", "2024-02-02")
+    assert second_adapter.requested_ranges[-1] == ("2024-02-27", "2024-03-02")
     first_state = database.get_sync_state("cloud_session", "user-1", "daily_activity")
     second_state = database.get_sync_state("cloud_session", "user-2", "daily_activity")
     assert first_state is not None
     assert second_state is not None
     assert first_state["cursor_date"] == "2024-02-02"
     assert second_state["cursor_date"] == "2024-03-02"
+
+
+def _activity(day, steps):
+    return DailyActivity(
+        id=f"daily-{day}",
+        provider="zepp_life",
+        source_type="cloud_session",
+        source_record_id=None,
+        user_id="user-1",
+        device_id=None,
+        collected_at=None,
+        date=day,
+        steps=steps,
+        distance_m=0,
+        active_kcal=0,
+        total_kcal=None,
+        floors=None,
+        active_minutes=None,
+    )
+
+
+class DatedActivityAdapter(ActivityAdapter):
+    """Serves only the days inside the requested range, as the cloud does."""
+
+    async def iter_daily_activity(self, start_date=None, end_date=None):
+        self.requested_ranges.append((start_date, end_date))
+        for record in self.records:
+            if start_date <= record.date <= end_date:
+                yield record
+
+
+async def test_resumed_sync_catches_a_day_that_finished_uploading_after_the_cursor(tmp_path):
+    database = Database(tmp_path / "test.db")
+    adapter = DatedActivityAdapter([_activity("2024-03-01", steps=4000)])
+    service = SyncService(adapter, database)
+    await service.sync_data_type("daily_activity", "2024-03-01", "2024-03-02")
+
+    # The rest of 1 March reaches Zepp only once the cursor already says 2 March.
+    adapter.records = [_activity("2024-03-01", steps=9000)]
+    result = await service.sync_data_type("daily_activity", end_date="2024-03-02")
+
+    assert adapter.requested_ranges[-1] == ("2024-02-29", "2024-03-02")
+    assert result["updated"] == 1
+    [stored] = database.query_daily_activity("user-1", "2024-03-01", "2024-03-01")
+    assert stored["steps"] == 9000
+
+
+async def test_cursor_past_the_end_date_is_clamped_instead_of_failing(tmp_path):
+    database = Database(tmp_path / "test.db")
+    adapter = ActivityAdapter([])
+    service = SyncService(adapter, database)
+    await service.sync_data_type("daily_activity", "2024-03-01", "2024-03-20")
+
+    await service.sync_data_type("daily_activity", end_date="2024-03-10")
+
+    assert adapter.requested_ranges[-1] == ("2024-03-10", "2024-03-10")
+
+
+async def test_default_end_date_is_today_in_the_adapter_timezone(tmp_path, monkeypatch):
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # 03:17 on 2 March in Kolkata is still 1 March in UTC.
+            return datetime(2024, 3, 1, 21, 47, tzinfo=UTC).astimezone(tz)
+
+    monkeypatch.setattr(sync_service, "datetime", FixedClock)
+    adapter = ActivityAdapter([])
+    adapter.timezone = "Asia/Kolkata"
+
+    result = await SyncService(adapter, Database(tmp_path / "test.db")).sync_data_type(
+        "daily_activity", start_date="2024-03-01"
+    )
+
+    assert result["end_date"] == "2024-03-02"
 
 
 async def test_empty_success_updates_attempt_and_advances_cursor(tmp_path):

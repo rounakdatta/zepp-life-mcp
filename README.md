@@ -157,10 +157,10 @@ docker run --rm -p 8080:8080 -v zepp-data:/data \
   zepp-life-mcp serve --read-only
 ```
 
-`charts/zepp-life-mcp` deploys a read-only HTTP server plus a nightly sync
-CronJob sharing one `ReadWriteOnce` volume. Because that volume is node-local,
-both workloads carry the same `nodeSelector` and the Deployment uses the
-`Recreate` strategy — a second pod cannot attach the same claim. SQLite runs in
+`charts/zepp-life-mcp` deploys a read-only HTTP server plus a sync CronJob
+(nightly by default, safe to run every few minutes) sharing one `ReadWriteOnce`
+volume. Because that volume is node-local, both workloads carry the same
+`nodeSelector` and the Deployment uses the `Recreate` strategy — a second pod cannot attach the same claim. SQLite runs in
 WAL mode so the server keeps reading while the job writes. The PVC is annotated
 `helm.sh/resource-policy: keep`: the archive cannot be re-fetched once Zepp stops
 serving the history.
@@ -206,6 +206,8 @@ All tool responses keep the backward-compatible JSON envelope with `status: "ok"
 - SQLite schema upgrades run automatically through `PRAGMA user_version` migrations.
 - Destructive rebuild migrations create a timestamped database backup first.
 - Sync cursors are scoped by source, user, and data type.
+- A resumed sync starts two days before its cursor, so data the phone uploads late
+  is still picked up; the default end date is today in `ZEPP_TIMEZONE`.
 - Empty successful syncs update the attempt/success state and advance the logical date cursor.
 - Failed or partial syncs report `failed_data_types`; a failed pass never advances its cursor.
 - Existing 0.1.0 databases are upgraded in place without reinterpreting legacy calendar dates.

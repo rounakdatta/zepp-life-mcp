@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.4
+
+### Fixed
+
+- **A resumed sync never re-read a day that finished uploading late.** Each pass
+  started exactly at the cursor the previous one stored, so whatever the phone
+  uploaded for an earlier day after that pass -- an evening the band only synced
+  the next morning -- was skipped for good. A resumed pass now starts
+  `CURSOR_LOOKBACK_DAYS` (two) before the cursor. Upserts are idempotent and an
+  identical payload is archived once, so the overlap costs a few requests, not
+  rows. This is also what makes a frequent schedule safe: a job every few minutes
+  moves the cursor to today within minutes of midnight.
+- **"Today" was the host's date, not the account's.** `sync` defaulted `end_date`
+  to `date.today()`, which in a UTC container is still yesterday for the first
+  five and a half hours of an IST day, so no pass in that gap could see the
+  morning just uploaded. It is now today in the adapter's timezone
+  (`ZEPP_TIMEZONE`).
+- A cursor later than the requested end date is clamped instead of failing every
+  run that follows.
+
 ## 0.5.3
 
 ### Fixed
