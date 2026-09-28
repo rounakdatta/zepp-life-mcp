@@ -188,18 +188,27 @@ async def cmd_sync_async(args):
     print(f"Синхронизация {len(data_types)} типов данных...")
     print()
 
+    failed = []
     for data_type in data_types:
         try:
             result = await sync_service.sync_data_type(
                 data_type=data_type,
                 start_date=args.start_date,
                 end_date=args.end_date,
+                lookback_days=args.lookback_days,
             )
             print(f"✅ {data_type}: {result['added']} добавлено, {result['updated']} обновлено")
         except Exception as e:
+            failed.append(data_type)
             print(f"❌ {data_type}: {e}")
 
     print()
+    if failed:
+        # A failed type keeps its cursor, so the next run retries the same range
+        # and nothing is lost. Exiting 0 would still mark the Job complete and
+        # hide a failure that repeats on every run, such as a lapsed token.
+        print(f"❌ Не удалось синхронизировать: {', '.join(failed)}")
+        sys.exit(1)
     print("Синхронизация завершена!")
 
 
@@ -253,6 +262,11 @@ def main():
     )
     sync_parser.add_argument("--start-date", help="Start date (YYYY-MM-DD)")
     sync_parser.add_argument("--end-date", help="End date (YYYY-MM-DD)")
+    sync_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        help="Days before the stored cursor a resumed pass re-reads (default 2)",
+    )
 
     args = parser.parse_args()
     if args.command == "serve" or args.command is None:

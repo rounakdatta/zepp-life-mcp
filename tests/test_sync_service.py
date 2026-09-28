@@ -173,6 +173,26 @@ async def test_cursor_past_the_end_date_is_clamped_instead_of_failing(tmp_path):
     assert adapter.requested_ranges[-1] == ("2024-03-10", "2024-03-10")
 
 
+async def test_lookback_days_widens_the_resume_window_for_a_deep_pass(tmp_path):
+    database = Database(tmp_path / "test.db")
+    adapter = ActivityAdapter([])
+    service = SyncService(adapter, database)
+    await service.sync_data_type("daily_activity", "2024-03-01", "2024-03-20")
+
+    await service.sync_data_type("daily_activity", end_date="2024-03-20", lookback_days=14)
+
+    assert adapter.requested_ranges[-1] == ("2024-03-06", "2024-03-20")
+
+
+async def test_negative_lookback_days_is_rejected(tmp_path):
+    database = Database(tmp_path / "test.db")
+    service = SyncService(ActivityAdapter([]), database)
+    await service.sync_data_type("daily_activity", "2024-03-01", "2024-03-20")
+
+    with pytest.raises(ValueError, match="lookback_days"):
+        await service.sync_data_type("daily_activity", end_date="2024-03-20", lookback_days=-1)
+
+
 async def test_default_end_date_is_today_in_the_adapter_timezone(tmp_path, monkeypatch):
     class FixedClock(datetime):
         @classmethod

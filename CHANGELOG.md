@@ -2,7 +2,19 @@
 
 ## 0.5.4
 
+### Added
+
+- `sync --lookback-days N`, and an optional daily deep CronJob in the chart
+  (`sync.deep`, 14 days by default). The regular pass covers the usual overnight
+  upload lag; the deep one catches data that reaches Zepp days late -- the phone
+  offline, or the app not syncing in the background -- and, when it adds rows at
+  all, is evidence the regular pass missed something.
+
 ### Fixed
+
+- **`sync` exited 0 when a data type failed**, so the Job read Complete while, say,
+  a lapsed token meant nothing was being collected. It now exits 1. The failed
+  type still keeps its cursor, so the next run retries the same range.
 
 - **A resumed sync never re-read a day that finished uploading late.** Each pass
   started exactly at the cursor the previous one stored, so whatever the phone
