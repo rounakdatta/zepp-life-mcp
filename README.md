@@ -208,11 +208,18 @@ All tool responses keep the backward-compatible JSON envelope with `status: "ok"
 - Sync cursors are scoped by source, user, and data type.
 - A resumed sync starts two days before its cursor, so data the phone uploads late
   is still picked up; the default end date is today in `ZEPP_TIMEZONE`.
+- It also starts no later than the day before the latest day the archive has band
+  data for (at most 30 days back). While the phone is offline that day stays put,
+  so the first pass after it reconnects reads the whole stretch it uploads.
 - `sync --lookback-days N` widens that window for one pass. The chart's optional
   `sync.deep` job runs such a pass daily (14 days) for data that reaches Zepp days
   late, e.g. while the phone is offline.
 - `sync` exits non-zero when any data type fails, so a scheduled job reports the
   failure instead of completing; the failed type keeps its cursor and retries.
+- `zepp-life-mcp snapshot --to PATH` writes a consistent single-file copy of the
+  database through SQLite's online backup API. Run it before a file-level backup
+  (a Velero pre-backup hook, say) rather than copying the live file, which a sync
+  writing at the same moment can tear.
 - Empty successful syncs update the attempt/success state and advance the logical date cursor.
 - Failed or partial syncs report `failed_data_types`; a failed pass never advances its cursor.
 - Existing 0.1.0 databases are upgraded in place without reinterpreting legacy calendar dates.

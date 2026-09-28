@@ -18,6 +18,9 @@ spec:
   timeZone: {{ $root.Values.sync.timeZone | quote }}
   {{- end }}
   concurrencyPolicy: {{ $root.Values.sync.concurrencyPolicy }}
+  {{- with $root.Values.sync.startingDeadlineSeconds }}
+  startingDeadlineSeconds: {{ . }}
+  {{- end }}
   successfulJobsHistoryLimit: {{ $root.Values.sync.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ $root.Values.sync.failedJobsHistoryLimit }}
   jobTemplate:

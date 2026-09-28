@@ -75,6 +75,10 @@ sync:
   # that is safe because SQLite waits out the other writer (busy_timeout) and
   # every write is an idempotent upsert.
   concurrencyPolicy: Forbid
+  # Skip a run that could not start within this many seconds of its slot rather
+  # than start it late. Worth setting on a frequent schedule: the next run is
+  # minutes away and resumes from the same point, so a skipped one loses nothing.
+  startingDeadlineSeconds: null
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
   backoffLimit: 2

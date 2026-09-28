@@ -6,7 +6,7 @@ import json
 import logging
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,7 @@ from zepp_life_mcp.models import (
     SleepSession,
     Workout,
 )
-from zepp_life_mcp.storage.migrations import run_migrations
+from zepp_life_mcp.storage.migrations import _check_integrity, run_migrations
 
 logger = logging.getLogger(__name__)
 
@@ -523,6 +523,18 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    def latest_daily_activity_date(self, user_id: str) -> str | None:
+        """The latest day the band has uploaded anything for, or None.
+
+        Zepp only files a day once the phone has sent some of it, so this is how
+        far the band's data has actually arrived -- not when a sync last ran.
+        """
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(date) FROM daily_activity WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return row[0] if row else None
+
     def query_daily_activity(
         self,
         user_id: str,
@@ -737,3 +749,38 @@ class Database:
                 )
 
             return results
+
+
+def snapshot_database(source: Path, destination: Path) -> Path:
+    """Write a consistent, self-contained copy of the archive to ``destination``.
+
+    A file-level backup of a live SQLite database copies the main file and its
+    WAL at different moments, and a checkpoint landing in between leaves a torn
+    copy. The online backup API reads a single consistent snapshot instead, so
+    this copy restores cleanly even when a sync was writing at the time. It is
+    written beside the destination and renamed into place, so a reader never
+    sees a half-written file.
+    """
+    # sqlite3.connect creates a missing file, which would "back up" an empty
+    # database without complaint.
+    if not source.is_file():
+        raise FileNotFoundError(f"No database at {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f"{destination.name}.partial")
+    partial.unlink(missing_ok=True)
+    try:
+        with (
+            closing(sqlite3.connect(source, timeout=30)) as live,
+            closing(sqlite3.connect(partial)) as copy,
+        ):
+            live.backup(copy)
+            # The copy inherits WAL mode; switching it back folds everything into
+            # the one file, so no -wal is left beside it to go missing.
+            copy.execute("PRAGMA journal_mode=DELETE")
+            _check_integrity(copy)
+        partial.replace(destination)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    return destination
+
