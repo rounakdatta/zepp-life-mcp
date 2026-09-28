@@ -397,6 +397,7 @@ def test_query_response_contract(status):
                 "--type {daily_activity,sleep,heart_rate,workouts,workout_details,body_measurements}",
                 "--start-date START_DATE",
                 "--end-date END_DATE",
+                "--lookback-days LOOKBACK_DAYS",
             ],
         ),
         (["serve", "--help"], ["usage: zepp-life-mcp serve [-h]"]),

@@ -67,6 +67,7 @@ class SyncService:
         start_date: str | None = None,
         end_date: str | None = None,
         force_full: bool = False,
+        lookback_days: int | None = None,
     ) -> dict[str, Any]:
         """Synchronize a specific data type.
 
@@ -78,6 +79,8 @@ class SyncService:
             end_date: End date (YYYY-MM-DD), defaults to today in the adapter's
                 timezone
             force_full: Force full sync ignoring last sync state
+            lookback_days: Days before the cursor a resumed pass starts, when
+                wider than the default is wanted (a daily deep pass)
 
         Returns:
             Dict with sync statistics
@@ -104,7 +107,10 @@ class SyncService:
             end_date = self._today().isoformat()
         if not start_date:
             if cursor_date:
-                resume = date.fromisoformat(cursor_date) - timedelta(days=CURSOR_LOOKBACK_DAYS)
+                days = CURSOR_LOOKBACK_DAYS if lookback_days is None else lookback_days
+                if days < 0:
+                    raise ValueError("lookback_days must not be negative")
+                resume = date.fromisoformat(cursor_date) - timedelta(days=days)
                 # A cursor can sit past end_date (an earlier run given a later
                 # --end-date); clamping keeps that from failing every run after.
                 start_date = min(resume, date.fromisoformat(end_date)).isoformat()

@@ -63,7 +63,17 @@ sync:
   # history on every run, which on a multi-year archive means re-processing
   # hundreds of thousands of heart-rate samples nightly for nothing.
   startDate: ""
-  # Forbid: two syncs must never write this SQLite file at once.
+  # A second, daily pass that re-reads `lookbackDays` before the cursor instead of
+  # the default two. It catches data that reaches Zepp days late -- the phone
+  # offline, or the app not syncing in the background -- which a frequent pass
+  # would already have moved past. It shares the settings above.
+  deep:
+    enabled: false
+    schedule: "47 3 * * *"
+    lookbackDays: 14
+  # Forbid: a sync never overlaps itself. The regular and deep jobs can overlap;
+  # that is safe because SQLite waits out the other writer (busy_timeout) and
+  # every write is an idempotent upsert.
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
