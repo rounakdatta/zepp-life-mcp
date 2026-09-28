@@ -372,12 +372,13 @@ def test_query_response_contract(status):
         (
             ["--help"],
             [
-                "usage: zepp-life-mcp [-h] {serve,setup,doctor,sync} ...",
+                "usage: zepp-life-mcp [-h] {serve,setup,doctor,sync,snapshot} ...",
                 "MCP server for Zepp Life data",
                 "serve",
                 "setup",
                 "doctor",
                 "sync",
+                "snapshot",
             ],
         ),
         (
@@ -400,6 +401,7 @@ def test_query_response_contract(status):
                 "--lookback-days LOOKBACK_DAYS",
             ],
         ),
+        (["snapshot", "--help"], ["usage: zepp-life-mcp snapshot [-h] --to TO"]),
         (["serve", "--help"], ["usage: zepp-life-mcp serve [-h]"]),
     ],
 )

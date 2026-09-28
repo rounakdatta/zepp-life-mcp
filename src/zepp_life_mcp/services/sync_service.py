@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 # and an identical payload is never archived twice.
 CURSOR_LOOKBACK_DAYS = 2
 
+# The cursor records when a sync last ran, not how far the band's data had got.
+# While the phone is offline, passes keep running and the cursor keeps moving,
+# so once it reconnects and uploads the missed days in one go, they sit behind
+# any fixed lookback. A pass therefore also resumes from the latest day the
+# archive has band data for, which stays put while nothing arrives. Capped, so a
+# band left in a drawer for months doesn't make every pass read months.
+MAX_CATCHUP_DAYS = 30
+
 
 class SyncService:
     """Service for synchronizing data from adapters to local database."""
@@ -73,9 +81,10 @@ class SyncService:
 
         Args:
             data_type: Type of data to sync (daily_activity, sleep, workouts, body_measurements)
-            start_date: Start date (YYYY-MM-DD), defaults to CURSOR_LOOKBACK_DAYS
-                before the stored cursor; without one, all history for the cloud
-                and 30 days for exports
+            start_date: Start date (YYYY-MM-DD), defaults to the earlier of
+                CURSOR_LOOKBACK_DAYS before the stored cursor and the day before
+                the latest one with band data; without a cursor, all history for
+                the cloud and 30 days for exports
             end_date: End date (YYYY-MM-DD), defaults to today in the adapter's
                 timezone
             force_full: Force full sync ignoring last sync state
@@ -110,10 +119,17 @@ class SyncService:
                 days = CURSOR_LOOKBACK_DAYS if lookback_days is None else lookback_days
                 if days < 0:
                     raise ValueError("lookback_days must not be negative")
+                end = date.fromisoformat(end_date)
                 resume = date.fromisoformat(cursor_date) - timedelta(days=days)
+                arrived = self.db.latest_daily_activity_date(user_id)
+                if arrived:
+                    # The day data last arrived for is usually partial; re-read
+                    # from the day before it.
+                    catch_up = date.fromisoformat(arrived) - timedelta(days=1)
+                    resume = min(resume, max(catch_up, end - timedelta(days=MAX_CATCHUP_DAYS)))
                 # A cursor can sit past end_date (an earlier run given a later
                 # --end-date); clamping keeps that from failing every run after.
-                start_date = min(resume, date.fromisoformat(end_date)).isoformat()
+                start_date = min(resume, end).isoformat()
             elif self.adapter.__class__.__name__ == "CloudSessionAdapter":
                 start_date = "2020-01-01"
             else:

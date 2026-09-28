@@ -13,7 +13,7 @@ from zepp_life_mcp.auth import setup_interactive as setup_cloud_auth
 from zepp_life_mcp.config import Config, get_config_path, load_config, save_config
 from zepp_life_mcp.server import main as server_main
 from zepp_life_mcp.services.sync_service import SyncService
-from zepp_life_mcp.storage import Database
+from zepp_life_mcp.storage import Database, snapshot_database
 
 PROGRAM_NAME = "zepp-life-mcp"
 
@@ -216,6 +216,20 @@ def cmd_sync(args):
     asyncio.run(cmd_sync_async(args))
 
 
+def cmd_snapshot(args):
+    try:
+        config = load_config()
+    except Exception as e:
+        print(f"❌ Ошибка загрузки конфигурации: {e}")
+        sys.exit(1)
+    try:
+        path = snapshot_database(Path(config.database_path), Path(args.to))
+    except Exception as e:
+        print(f"❌ Снимок не создан: {e}")
+        sys.exit(1)
+    print(f"✅ {path} ({path.stat().st_size} bytes)")
+
+
 def main():
     parser = argparse.ArgumentParser(prog=PROGRAM_NAME, description="MCP server for Zepp Life data")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -268,6 +282,11 @@ def main():
         help="Days before the stored cursor a resumed pass re-reads (default 2)",
     )
 
+    snapshot_parser = subparsers.add_parser(
+        "snapshot", help="Write a consistent copy of the database, e.g. before a backup"
+    )
+    snapshot_parser.add_argument("--to", required=True, help="Destination file")
+
     args = parser.parse_args()
     if args.command == "serve" or args.command is None:
         # The bearer token is env-only on purpose: an argv secret is visible in
@@ -287,6 +306,8 @@ def main():
         cmd_doctor(args)
     elif args.command == "sync":
         cmd_sync(args)
+    elif args.command == "snapshot":
+        cmd_snapshot(args)
     else:
         parser.print_help()
         sys.exit(1)

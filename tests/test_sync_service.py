@@ -162,6 +162,36 @@ async def test_resumed_sync_catches_a_day_that_finished_uploading_after_the_curs
     assert stored["steps"] == 9000
 
 
+async def test_days_uploaded_after_an_offline_stretch_are_caught_by_the_next_pass(tmp_path):
+    database = Database(tmp_path / "test.db")
+    adapter = DatedActivityAdapter([_activity("2024-03-01", steps=4000)])
+    service = SyncService(adapter, database)
+    await service.sync_data_type("daily_activity", "2024-03-01", "2024-03-01")
+    # The phone is offline: passes keep running and the cursor keeps moving.
+    adapter.records = []
+    for day in range(2, 11):
+        await service.sync_data_type("daily_activity", end_date=f"2024-03-{day:02d}")
+
+    # It reconnects and uploads the whole stretch at once.
+    adapter.records = [_activity(f"2024-03-{day:02d}", steps=5000) for day in range(1, 11)]
+    result = await service.sync_data_type("daily_activity", end_date="2024-03-10")
+
+    assert adapter.requested_ranges[-1] == ("2024-02-29", "2024-03-10")
+    assert result["added"] == 9
+    assert result["updated"] == 1
+
+
+async def test_catch_up_after_a_long_silence_is_capped(tmp_path):
+    database = Database(tmp_path / "test.db")
+    adapter = DatedActivityAdapter([_activity("2024-01-01", steps=4000)])
+    service = SyncService(adapter, database)
+    await service.sync_data_type("daily_activity", "2024-01-01", "2024-03-30")
+
+    await service.sync_data_type("daily_activity", end_date="2024-03-30")
+
+    assert adapter.requested_ranges[-1] == ("2024-02-29", "2024-03-30")
+
+
 async def test_cursor_past_the_end_date_is_clamped_instead_of_failing(tmp_path):
     database = Database(tmp_path / "test.db")
     adapter = ActivityAdapter([])
