@@ -90,14 +90,45 @@ class Database:
             key_values,
         ).fetchone()
 
+        # If that misses but a row with the same id already exists (e.g. a
+        # re-uploaded day whose timestamp shifted), use that row instead of
+        # inserting a colliding id. This is what keeps a shifted-timestamp
+        # re-upload from crashing the whole sync with "UNIQUE constraint failed".
+        id_probe = False
+        if existing is None and "id" in values:
+            existing = conn.execute(
+                f"SELECT * FROM {table} WHERE id = ?", (values["id"],)
+            ).fetchone()
+            id_probe = existing is not None
+
         if existing is None:
             columns = tuple(values)
             placeholders = ", ".join("?" for _ in columns)
-            conn.execute(
-                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
-                tuple(values[column] for column in columns),
-            )
-            return UpsertOutcome.INSERTED
+            try:
+                conn.execute(
+                    f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+                    tuple(values[column] for column in columns),
+                )
+                return UpsertOutcome.INSERTED
+            except sqlite3.IntegrityError:
+                # Last resort: another row owns this id or semantic key; look it
+                # up by id once more and treat as unchanged rather than crashing.
+                if "id" in values:
+                    existing = conn.execute(
+                        f"SELECT * FROM {table} WHERE id = ?", (values["id"],)
+                    ).fetchone()
+                    if existing is not None:
+                        id_probe = True
+                if existing is None:
+                    raise
+
+        # Choose the UPDATE predicate based on how we found the row.
+        if id_probe:
+            update_predicate = "id = ?"
+            update_key_values = (values["id"],)
+        else:
+            update_predicate = predicate
+            update_key_values = key_values
 
         changed_values = {
             column: value
@@ -110,8 +141,8 @@ class Database:
         assignments = ", ".join(f"{column} = ?" for column in changed_values)
         conn.execute(
             f"UPDATE {table} SET {assignments}, updated_at = CURRENT_TIMESTAMP "
-            f"WHERE {predicate}",
-            (*changed_values.values(), *key_values),
+            f"WHERE {update_predicate}",
+            (*changed_values.values(), *update_key_values),
         )
         return UpsertOutcome.UPDATED
 
