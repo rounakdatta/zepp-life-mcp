@@ -125,6 +125,10 @@ zepp-life-mcp serve --transport http --port 8080 --read-only
 
 - the endpoint is `POST /mcp`; clients send `Authorization: Bearer $ZEPP_MCP_AUTH_TOKEN`
 - `/healthz` is outside the auth check so container probes need no credential
+- `/metrics` is outside it too: Prometheus text with sync timestamps, the newest
+  day in the archive, and the newest day Zepp itself has (asked independently, at
+  most every ten minutes). It holds no archive values, but route only `/mcp`
+  through an ingress so it stays inside the cluster
 - `--read-only` removes `sync_data`, so a separate scheduled `sync` can own the
   database and there is exactly one writer
 - the token is read from the environment, never a flag, because an argv secret is

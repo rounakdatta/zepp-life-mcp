@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
@@ -20,8 +21,9 @@ from mcp.types import CallToolResult, TextContent, Tool
 from zepp_life_mcp.adapters.base import DataAdapter
 from zepp_life_mcp.adapters.cloud_session import CloudSessionAdapter
 from zepp_life_mcp.adapters.export_file import ExportFileAdapter
-from zepp_life_mcp.auth import load_token
+from zepp_life_mcp.auth import ENV_USER_ID, load_token
 from zepp_life_mcp.config import Config, load_config
+from zepp_life_mcp.metrics import UpstreamProbe, render_metrics
 from zepp_life_mcp.models import ConnectionStatus, QueryResponse
 from zepp_life_mcp.services.query_service import QueryService
 from zepp_life_mcp.services.sync_service import SyncService
@@ -947,11 +949,61 @@ async def _configure_runtime() -> None:
         context.query_service = QueryService(context.db, user_id or "unknown")
 
 
+_upstream_probe: UpstreamProbe | None = None
+
+
+_metrics_user: str | None = None
+
+
+def _metrics_user_id() -> str | None:
+    """Whose archive this is: the same fallbacks the runtime itself uses.
+
+    Reads only the user id, never the token file, so a bad token can't fail a
+    scrape; and remembers the answer, because the archive fallback scans a
+    large table.
+    """
+    global _metrics_user
+    if _metrics_user:
+        return _metrics_user
+    user_id = os.environ.get(ENV_USER_ID) or None
+    if not user_id and context.adapter:
+        user_id = context.adapter.get_user_id()
+    if not user_id and context.db:
+        user_id = context.db.sole_user_id()
+    _metrics_user = user_id
+    return user_id
+
+
+def _probe_credentials() -> tuple[str | None, str | None]:
+    # Read on every probe: with ZEPP_APP_TOKEN_FILE pointing at a mounted
+    # Secret, a renewed apptoken reaches the probe without a restart. Errors
+    # here are contained by UpstreamProbe.refresh.
+    token, _ = load_token()
+    return token, _metrics_user_id()
+
+
+def _metrics_probe() -> UpstreamProbe | None:
+    """The process-wide upstream probe; only a cloud session has an upstream."""
+    global _upstream_probe
+    if context.config is None or context.config.mode != "cloud_session":
+        return None
+    if _upstream_probe is None:
+        _upstream_probe = UpstreamProbe(
+            _probe_credentials,
+            timezone=context.config.timezone,
+            api_host=context.config.api_host,
+        )
+    return _upstream_probe
+
+
 def build_http_app(auth_token: str | None, read_only: bool = False):
     """ASGI app exposing the MCP streamable-HTTP transport at /mcp.
 
     /healthz is deliberately outside the auth check so kubelet probes work
-    without handing the cluster a credential.
+    without handing the cluster a credential. /metrics is outside it for the same
+    reason, so a prober can watch the sync without the token that opens the
+    archive; it carries timestamps and flags only (see zepp_life_mcp.metrics).
+    Route only /mcp through an ingress so neither leaves the cluster.
     """
     from starlette.applications import Starlette
     from starlette.responses import PlainTextResponse
@@ -966,6 +1018,16 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
     async def healthz(_request):
         return PlainTextResponse("ok")
 
+    async def metrics(_request):
+        if context.db is None or context.config is None:
+            return PlainTextResponse("runtime not configured\n", status_code=503)
+        user_id = _metrics_user_id()
+        probe = _metrics_probe()
+        # Never awaits Zepp: the probe refreshes in the background.
+        result = probe.snapshot() if probe else None
+        body = render_metrics(context.db, context.config.mode, user_id, result)
+        return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         async with session_manager.run():
@@ -977,7 +1039,11 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
 
     http_app: Any = McpPathNormalizer(
         Starlette(
-            routes=[Route("/healthz", healthz, methods=["GET"]), Mount("/mcp", app=handle_mcp)],
+            routes=[
+                Route("/healthz", healthz, methods=["GET"]),
+                Route("/metrics", metrics, methods=["GET"]),
+                Mount("/mcp", app=handle_mcp),
+            ],
             lifespan=lifespan,
         )
     )
@@ -987,7 +1053,9 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
             "Serving HTTP without an auth token: every caller reaches the full archive"
         )
         return http_app
-    return BearerAuthMiddleware(http_app, auth_token, exempt_paths=frozenset({"/healthz"}))
+    return BearerAuthMiddleware(
+        http_app, auth_token, exempt_paths=frozenset({"/healthz", "/metrics"})
+    )
 
 
 class McpPathNormalizer:
