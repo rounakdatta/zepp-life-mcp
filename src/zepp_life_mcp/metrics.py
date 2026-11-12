@@ -44,6 +44,10 @@ DEFAULT_API_HOST = "https://api-mifit.huami.com"
 PROBE_INTERVAL_SECONDS = 600
 PROBE_WINDOW_DAYS = 30
 PROBE_TIMEOUT_SECONDS = 15.0
+# How long a failed probe keeps reporting the last good day: long enough to
+# bridge a flaky probe under a "for 30 minutes" rule, short enough that a dead
+# token can't age that day into "the phone stopped uploading".
+KEEP_LAST_GOOD_SECONDS = 3600
 
 SYNC_DATA_TYPES = (
     "daily_activity",
@@ -181,7 +185,12 @@ class UpstreamProbe:
         previous = self._last
         if result.ok:
             result = ProbeResult(result.checked_at, True, result.http_status, result.newest_day, now)
-        elif previous is not None and previous.newest_day is not None:
+        elif (
+            previous is not None
+            and previous.newest_day is not None
+            and previous.newest_day_at is not None
+            and now - previous.newest_day_at <= KEEP_LAST_GOOD_SECONDS
+        ):
             result = ProbeResult(
                 result.checked_at,
                 False,

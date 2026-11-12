@@ -357,6 +357,7 @@ def test_metrics_needs_no_bearer_but_mcp_still_does(tmp_path, monkeypatch):
     probe = UpstreamProbe(lambda: ("tok", "u1"), transport=httpx.MockTransport(handler))
     probe._last = ProbeResult(datetime.now(UTC).timestamp(), True, 200, date(2026, 11, 10))
     monkeypatch.setattr(server, "_upstream_probe", probe)
+    monkeypatch.setattr(server, "_metrics_user", None)
     monkeypatch.setattr(server, "context", server.RuntimeContext())
 
     app = server.build_http_app("secret-bearer", read_only=True)
@@ -414,12 +415,40 @@ async def test_a_failed_probe_keeps_the_last_good_day():
     assert failed.newest_day_at == NOW
 
 
-def test_sqlite_timestamps_are_utc_whatever_the_local_zone():
+def test_sqlite_timestamps_are_utc_whatever_the_local_zone(monkeypatch):
+    import time as _time
+
     from zepp_life_mcp.metrics import _sqlite_utc_seconds
 
-    assert _sqlite_utc_seconds("2026-11-11 17:15:13") == datetime(
-        2026, 11, 11, 17, 15, 13, tzinfo=UTC
-    ).timestamp()
+    # CI runs in UTC, where reading the text as local time would also pass.
+    monkeypatch.setenv("TZ", "Asia/Kolkata")
+    _time.tzset()
+    try:
+        assert _sqlite_utc_seconds("2026-11-11 17:15:13") == datetime(
+            2026, 11, 11, 17, 15, 13, tzinfo=UTC
+        ).timestamp()
+    finally:
+        monkeypatch.undo()
+        _time.tzset()
+
+
+async def test_a_long_failure_drops_the_kept_day():
+    replies = iter(
+        [httpx.Response(200, json=_band_response("2026-11-10"))]
+        + [httpx.Response(401, json={"code": 0})] * 10
+    )
+    clock = _Clock(NOW)
+    probe = UpstreamProbe(
+        _creds(), transport=httpx.MockTransport(lambda r: next(replies)), clock=clock
+    )
+    await probe.refresh()
+    clock.now += 1800
+    assert (await probe.refresh()).newest_day == date(2026, 11, 10)
+    # A dead token must not let the kept day age into "the phone stopped
+    # uploading": after an hour it is dropped, and probe_ok carries the news.
+    clock.now += 1801
+    late = await probe.refresh()
+    assert late.newest_day is None and late.ok is False
 
 
 def test_workout_details_sync_is_reported(tmp_path):
@@ -450,6 +479,8 @@ def test_the_server_builds_the_probe_in_the_users_timezone(monkeypatch):
     monkeypatch.setattr(server, "_upstream_probe", None)
     probe = server._metrics_probe()
     assert probe is not None and probe._tz.key == "Asia/Kolkata"
+    # The server must hand over the re-reading function, not a token captured once.
+    assert probe._credentials is server._probe_credentials
 
 
 def test_a_due_refresh_never_delays_the_scrape(tmp_path, monkeypatch):
