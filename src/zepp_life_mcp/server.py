@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import secrets
 import uuid
 from collections.abc import Awaitable, Callable
@@ -20,7 +21,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 from zepp_life_mcp.adapters.base import DataAdapter
 from zepp_life_mcp.adapters.cloud_session import CloudSessionAdapter
 from zepp_life_mcp.adapters.export_file import ExportFileAdapter
-from zepp_life_mcp.auth import load_token
+from zepp_life_mcp.auth import ENV_USER_ID, load_token
 from zepp_life_mcp.config import Config, load_config
 from zepp_life_mcp.metrics import UpstreamProbe, render_metrics
 from zepp_life_mcp.models import ConnectionStatus, QueryResponse
@@ -951,19 +952,32 @@ async def _configure_runtime() -> None:
 _upstream_probe: UpstreamProbe | None = None
 
 
+_metrics_user: str | None = None
+
+
 def _metrics_user_id() -> str | None:
-    """Whose archive this is: the same fallbacks the runtime itself uses."""
-    _, user_id = load_token()
+    """Whose archive this is: the same fallbacks the runtime itself uses.
+
+    Reads only the user id, never the token file, so a bad token can't fail a
+    scrape; and remembers the answer, because the archive fallback scans a
+    large table.
+    """
+    global _metrics_user
+    if _metrics_user:
+        return _metrics_user
+    user_id = os.environ.get(ENV_USER_ID) or None
     if not user_id and context.adapter:
         user_id = context.adapter.get_user_id()
     if not user_id and context.db:
         user_id = context.db.sole_user_id()
+    _metrics_user = user_id
     return user_id
 
 
 def _probe_credentials() -> tuple[str | None, str | None]:
     # Read on every probe: with ZEPP_APP_TOKEN_FILE pointing at a mounted
-    # Secret, a renewed apptoken reaches the probe without a restart.
+    # Secret, a renewed apptoken reaches the probe without a restart. Errors
+    # here are contained by UpstreamProbe.refresh.
     token, _ = load_token()
     return token, _metrics_user_id()
 

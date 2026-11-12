@@ -119,7 +119,7 @@ async def test_probe_asks_for_a_month_in_the_users_timezone_and_reports_the_newe
     )
     result = await probe.refresh()
 
-    assert result == ProbeResult(NOW, True, 200, date(2026, 11, 10))
+    assert result == ProbeResult(NOW, True, 200, date(2026, 11, 10), NOW)
     params = dict(seen[0].url.params)
     assert params["to_date"] == "2026-11-12"
     # Wide enough that a phone silent for days still has a newest day to report,
@@ -372,3 +372,121 @@ def test_metrics_needs_no_bearer_but_mcp_still_does(tmp_path, monkeypatch):
         for path in ("/mcp", "/mcp/"):
             assert client.post(path, json={}).status_code == 401
         assert client.get("/healthz").status_code == 200
+
+
+# -- second review ------------------------------------------------------------
+
+
+async def test_after_a_long_gap_the_old_answer_is_withheld_until_fresh():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_band_response("2026-11-10"))
+
+    clock = _Clock(NOW)
+    probe = UpstreamProbe(
+        _creds(), transport=httpx.MockTransport(handler), interval=600, clock=clock
+    )
+    await probe.refresh()
+    clock.now += 3 * 24 * 3600  # the prober was down for three days
+    # A three-day-old "newest day" would read as a phone that stopped uploading.
+    assert probe.snapshot() is None
+    await probe._task
+    assert probe.snapshot().checked_at == clock.now
+
+
+async def test_a_failed_probe_keeps_the_last_good_day():
+    replies = iter(
+        [
+            httpx.Response(200, json=_band_response("2026-11-10")),
+            httpx.Response(502, text="bad gateway"),
+        ]
+    )
+    clock = _Clock(NOW)
+    probe = UpstreamProbe(
+        _creds(), transport=httpx.MockTransport(lambda r: next(replies)), clock=clock
+    )
+    await probe.refresh()
+    clock.now += 600
+    failed = await probe.refresh()
+    # One bad request must not make the day vanish: a check watching it with a
+    # "for" would restart its timer and never fire.
+    assert failed.ok is False and failed.http_status == 502
+    assert failed.newest_day == date(2026, 11, 10)
+    assert failed.newest_day_at == NOW
+
+
+def test_sqlite_timestamps_are_utc_whatever_the_local_zone():
+    from zepp_life_mcp.metrics import _sqlite_utc_seconds
+
+    assert _sqlite_utc_seconds("2026-11-11 17:15:13") == datetime(
+        2026, 11, 11, 17, 15, 13, tzinfo=UTC
+    ).timestamp()
+
+
+def test_workout_details_sync_is_reported(tmp_path):
+    db = Database(tmp_path / "z.db")
+    db.update_sync_state("cloud_session", "u1", "workout_details", success=False, error="HTTP 500")
+    text = render_metrics(db, "cloud_session", "u1", None)
+    assert _metric(text, "zepp_sync_last_attempt_failed", data_type="workout_details") == 1
+
+
+def test_the_server_rereads_the_token_file_on_every_probe(tmp_path, monkeypatch):
+    token_file = tmp_path / "apptoken"
+    token_file.write_text("old\n")
+    monkeypatch.delenv("ZEPP_APP_TOKEN", raising=False)
+    monkeypatch.setenv("ZEPP_APP_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("ZEPP_USER_ID", "u1")
+    monkeypatch.setattr(server, "_metrics_user", None)
+    assert server._probe_credentials() == ("old", "u1")
+    token_file.write_text("renewed\n")
+    assert server._probe_credentials() == ("renewed", "u1")
+
+
+def test_the_server_builds_the_probe_in_the_users_timezone(monkeypatch):
+    from zepp_life_mcp.config import Config
+
+    ctx = server.RuntimeContext()
+    ctx.config = Config(mode="cloud_session", timezone="Asia/Kolkata")
+    monkeypatch.setattr(server, "context", ctx)
+    monkeypatch.setattr(server, "_upstream_probe", None)
+    probe = server._metrics_probe()
+    assert probe is not None and probe._tz.key == "Asia/Kolkata"
+
+
+def test_a_due_refresh_never_delays_the_scrape(tmp_path, monkeypatch):
+    import asyncio
+    import time as _time
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("ZEPP_DATABASE_PATH", str(tmp_path / "z.db"))
+    monkeypatch.setenv("ZEPP_MODE", "cloud_session")
+    monkeypatch.setenv("ZEPP_APP_TOKEN", "tok")
+    monkeypatch.setenv("ZEPP_USER_ID", "u1")
+    monkeypatch.setattr(server, "_metrics_user", None)
+    monkeypatch.setattr(server, "context", server.RuntimeContext())
+
+    class Slow(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            await asyncio.sleep(2)
+            return httpx.Response(200, json=_band_response("2026-11-10"))
+
+    # Nothing cached: the first scrape is due a refresh, against a Zepp that
+    # takes two seconds.
+    monkeypatch.setattr(server, "_upstream_probe", UpstreamProbe(lambda: ("tok", "u1"), transport=Slow()))
+    app = server.build_http_app("secret-bearer", read_only=True)
+    with TestClient(app) as client:
+        start = _time.monotonic()
+        assert client.get("/metrics").status_code == 200
+        assert _time.monotonic() - start < 1.0
+
+
+def test_an_unreadable_token_file_does_not_break_the_scrape(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_metrics_user", None)
+    monkeypatch.setenv("ZEPP_USER_ID", "u1")
+    bad = tmp_path / "apptoken"
+    bad.write_bytes(b"\xff\xfe\xfa")
+    monkeypatch.delenv("ZEPP_APP_TOKEN", raising=False)
+    monkeypatch.setenv("ZEPP_APP_TOKEN_FILE", str(bad))
+    # The route only needs the user id; the token is the probe's business, and
+    # the probe contains its own errors.
+    assert server._metrics_user_id() == "u1"

@@ -70,6 +70,10 @@ class ProbeResult:
     ok: bool
     http_status: int | None
     newest_day: date | None
+    # When newest_day was last confirmed. A failed probe keeps the last good
+    # day (ok=False says the answer is old) so one bad request doesn't make the
+    # day vanish and restart every "for 30 minutes" timer that watches it.
+    newest_day_at: float | None = None
 
 
 def _decode_summary(value: Any) -> dict[str, Any]:
@@ -153,11 +157,18 @@ class UpstreamProbe:
         self._task: asyncio.Task[ProbeResult] | None = None
 
     def snapshot(self) -> ProbeResult | None:
-        """The latest answer, starting a background refresh when one is due."""
+        """The latest answer, starting a background refresh when one is due.
+
+        An answer older than two intervals is withheld until the refresh lands:
+        after a long gap in scrapes, a days-old "newest day" would read as a
+        phone that stopped uploading.
+        """
         now = self._clock()
         due = self._last is None or now - self._last.checked_at >= self._interval
         if due and (self._task is None or self._task.done()):
             self._task = asyncio.get_running_loop().create_task(self.refresh())
+        if self._last is not None and now - self._last.checked_at > 2 * self._interval:
+            return None
         return self._last
 
     async def refresh(self) -> ProbeResult:
@@ -167,6 +178,17 @@ class UpstreamProbe:
         except Exception as exc:  # a probe bug must never take /metrics down
             logger.warning("Upstream probe raised %s", type(exc).__name__)
             result = ProbeResult(now, False, None, None)
+        previous = self._last
+        if result.ok:
+            result = ProbeResult(result.checked_at, True, result.http_status, result.newest_day, now)
+        elif previous is not None and previous.newest_day is not None:
+            result = ProbeResult(
+                result.checked_at,
+                False,
+                result.http_status,
+                previous.newest_day,
+                previous.newest_day_at,
+            )
         self._last = result
         return result
 
@@ -340,11 +362,18 @@ def render_metrics(
                 "HTTP status of the last probe.",
                 probe.http_status,
             )
-        if probe.ok and probe.newest_day is not None:
+        if probe.newest_day is not None:
             out.add(
                 "zepp_upstream_newest_day_timestamp_seconds",
-                "The newest day Zepp has filed band data for, as its UTC-midnight timestamp.",
+                "The newest day Zepp has filed band data for, as its UTC-midnight timestamp. "
+                "Kept from the last good probe while probes fail (see zepp_upstream_probe_ok).",
                 day_seconds(probe.newest_day),
+            )
+        if probe.newest_day_at is not None:
+            out.add(
+                "zepp_upstream_newest_day_confirmed_timestamp_seconds",
+                "When Zepp last confirmed that newest day.",
+                probe.newest_day_at,
             )
 
     return out.text()
