@@ -22,6 +22,7 @@ from zepp_life_mcp.adapters.cloud_session import CloudSessionAdapter
 from zepp_life_mcp.adapters.export_file import ExportFileAdapter
 from zepp_life_mcp.auth import load_token
 from zepp_life_mcp.config import Config, load_config
+from zepp_life_mcp.metrics import UpstreamProbe, render_metrics
 from zepp_life_mcp.models import ConnectionStatus, QueryResponse
 from zepp_life_mcp.services.query_service import QueryService
 from zepp_life_mcp.services.sync_service import SyncService
@@ -947,11 +948,40 @@ async def _configure_runtime() -> None:
         context.query_service = QueryService(context.db, user_id or "unknown")
 
 
+_upstream_probe: UpstreamProbe | None = None
+
+
+def _metrics_user_id() -> str | None:
+    _, user_id = load_token()
+    if user_id:
+        return user_id
+    return context.adapter.get_user_id() if context.adapter else None
+
+
+def _metrics_probe(user_id: str | None) -> UpstreamProbe | None:
+    """The process-wide upstream probe; only a cloud session has an upstream."""
+    global _upstream_probe
+    if context.config is None or context.config.mode != "cloud_session":
+        return None
+    if _upstream_probe is None:
+        token, _ = load_token()
+        _upstream_probe = UpstreamProbe(
+            token,
+            user_id,
+            timezone=context.config.timezone,
+            api_host=context.config.api_host,
+        )
+    return _upstream_probe
+
+
 def build_http_app(auth_token: str | None, read_only: bool = False):
     """ASGI app exposing the MCP streamable-HTTP transport at /mcp.
 
     /healthz is deliberately outside the auth check so kubelet probes work
-    without handing the cluster a credential.
+    without handing the cluster a credential. /metrics is outside it for the same
+    reason, so a prober can watch the sync without the token that opens the
+    archive; it carries timestamps and flags only (see zepp_life_mcp.metrics).
+    Route only /mcp through an ingress so neither leaves the cluster.
     """
     from starlette.applications import Starlette
     from starlette.responses import PlainTextResponse
@@ -966,6 +996,15 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
     async def healthz(_request):
         return PlainTextResponse("ok")
 
+    async def metrics(_request):
+        if context.db is None or context.config is None:
+            return PlainTextResponse("runtime not configured\n", status_code=503)
+        user_id = _metrics_user_id()
+        probe = _metrics_probe(user_id)
+        result = await probe.result() if probe else None
+        body = render_metrics(context.db, context.config.mode, user_id, result)
+        return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
     @contextlib.asynccontextmanager
     async def lifespan(_app):
         async with session_manager.run():
@@ -977,7 +1016,11 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
 
     http_app: Any = McpPathNormalizer(
         Starlette(
-            routes=[Route("/healthz", healthz, methods=["GET"]), Mount("/mcp", app=handle_mcp)],
+            routes=[
+                Route("/healthz", healthz, methods=["GET"]),
+                Route("/metrics", metrics, methods=["GET"]),
+                Mount("/mcp", app=handle_mcp),
+            ],
             lifespan=lifespan,
         )
     )
@@ -987,7 +1030,9 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
             "Serving HTTP without an auth token: every caller reaches the full archive"
         )
         return http_app
-    return BearerAuthMiddleware(http_app, auth_token, exempt_paths=frozenset({"/healthz"}))
+    return BearerAuthMiddleware(
+        http_app, auth_token, exempt_paths=frozenset({"/healthz", "/metrics"})
+    )
 
 
 class McpPathNormalizer:

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.6
+
+### Added
+
+- **`GET /metrics`** on the HTTP transport, in Prometheus text format and outside
+  the bearer check like `/healthz`, so the sync can be watched without the token
+  that opens the archive. It carries timestamps and flags only:
+  - `zepp_sync_last_attempt_timestamp_seconds`,
+    `zepp_sync_last_success_timestamp_seconds` and `zepp_sync_last_attempt_failed`,
+    per data type, from `sync_state`;
+  - `zepp_archive_newest_day_timestamp_seconds`, the newest day the archive holds
+    (daily activity, sleep and workouts);
+  - `zepp_upstream_newest_day_timestamp_seconds`, the newest day **Zepp** has filed,
+    from a two-day band_data request that shares nothing with the sync, plus
+    `zepp_upstream_probe_ok` and `zepp_upstream_probe_http_status`. At most one
+    request every ten minutes.
+
+  Comparing the two newest-day metrics tells a broken sync (the archive falls
+  behind Zepp) from a phone that hasn't uploaded (both stop at the same day).
+  Route only `/mcp` through an ingress so `/metrics` stays in the cluster.
+
 ## 0.5.4
 
 The goal of this release is a sync that can run every few minutes without ever

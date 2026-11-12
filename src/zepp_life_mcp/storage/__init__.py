@@ -554,6 +554,18 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
+    def newest_archive_days(self, user_id: str, queries: dict[str, str]) -> dict[str, str | None]:
+        """The newest day per data type, each from a one-parameter MAX() query.
+
+        Read-only and cheap, for /metrics: a scrape must never take a write lock
+        the sync is waiting for.
+        """
+        with self._get_connection() as conn:
+            return {
+                data_type: conn.execute(sql, (user_id,)).fetchone()[0]
+                for data_type, sql in queries.items()
+            }
+
     def latest_daily_activity_date(self, user_id: str) -> str | None:
         """The latest day the band has uploaded anything for, or None.
 
