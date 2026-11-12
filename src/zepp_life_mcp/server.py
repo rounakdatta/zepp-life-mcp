@@ -952,22 +952,30 @@ _upstream_probe: UpstreamProbe | None = None
 
 
 def _metrics_user_id() -> str | None:
+    """Whose archive this is: the same fallbacks the runtime itself uses."""
     _, user_id = load_token()
-    if user_id:
-        return user_id
-    return context.adapter.get_user_id() if context.adapter else None
+    if not user_id and context.adapter:
+        user_id = context.adapter.get_user_id()
+    if not user_id and context.db:
+        user_id = context.db.sole_user_id()
+    return user_id
 
 
-def _metrics_probe(user_id: str | None) -> UpstreamProbe | None:
+def _probe_credentials() -> tuple[str | None, str | None]:
+    # Read on every probe: with ZEPP_APP_TOKEN_FILE pointing at a mounted
+    # Secret, a renewed apptoken reaches the probe without a restart.
+    token, _ = load_token()
+    return token, _metrics_user_id()
+
+
+def _metrics_probe() -> UpstreamProbe | None:
     """The process-wide upstream probe; only a cloud session has an upstream."""
     global _upstream_probe
     if context.config is None or context.config.mode != "cloud_session":
         return None
     if _upstream_probe is None:
-        token, _ = load_token()
         _upstream_probe = UpstreamProbe(
-            token,
-            user_id,
+            _probe_credentials,
             timezone=context.config.timezone,
             api_host=context.config.api_host,
         )
@@ -1000,8 +1008,9 @@ def build_http_app(auth_token: str | None, read_only: bool = False):
         if context.db is None or context.config is None:
             return PlainTextResponse("runtime not configured\n", status_code=503)
         user_id = _metrics_user_id()
-        probe = _metrics_probe(user_id)
-        result = await probe.result() if probe else None
+        probe = _metrics_probe()
+        # Never awaits Zepp: the probe refreshes in the background.
+        result = probe.snapshot() if probe else None
         body = render_metrics(context.db, context.config.mode, user_id, result)
         return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
 

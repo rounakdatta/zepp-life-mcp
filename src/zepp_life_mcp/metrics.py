@@ -13,8 +13,9 @@ apart from a broken sync:
   asked by :class:`UpstreamProbe`. It shares nothing with the sync's code path
   (not the adapter, the cursor or the parser) beyond the definition of a filed
   day, so a sync bug that silently drops data shows up as the archive falling
-  behind it. A two-day window keeps the request far below band_data's 500-row
-  cap, the very cap that once hid the newest days from the sync.
+  behind it. Its 30-day window is far below band_data's 500-row cap (the very
+  cap that once hid the newest days from the sync), and wide enough that a phone
+  silent for days still has a newest day to report.
 
 When the phone has not uploaded, both views stop at the same day: the archive is
 stale but the sync is fine.
@@ -41,10 +42,17 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_API_HOST = "https://api-mifit.huami.com"
 PROBE_INTERVAL_SECONDS = 600
-PROBE_WINDOW_DAYS = 2
+PROBE_WINDOW_DAYS = 30
 PROBE_TIMEOUT_SECONDS = 15.0
 
-SYNC_DATA_TYPES = ("daily_activity", "sleep", "heart_rate", "workouts", "body_measurements")
+SYNC_DATA_TYPES = (
+    "daily_activity",
+    "sleep",
+    "heart_rate",
+    "workouts",
+    "workout_details",
+    "body_measurements",
+)
 
 # The day columns that are cheap to MAX() over. heart_rate_samples is left out on
 # purpose: it is by far the largest table, and its sync_state already says whether
@@ -117,50 +125,65 @@ def _band_rows(payload: Any) -> list[Any] | None:
 class UpstreamProbe:
     """Asks Zepp for its newest filed day, at most once per ``interval`` seconds.
 
-    Scrapes in between get the cached answer, so a scrape every minute costs Zepp
-    one small request every ten minutes.
+    A scrape never waits on Zepp: :meth:`snapshot` returns the last answer at
+    once and, when it is due, starts a refresh in the background. A slow Zepp
+    therefore delays the number, never the scrape (a prober times scrapes out
+    and would read that as a failure).
+
+    ``credentials`` is called on every probe, so a renewed token (mounted as a
+    file) or a user id learnt after start-up is picked up without a restart.
     """
 
     def __init__(
         self,
-        token: str | None,
-        user_id: str | None,
+        credentials: Callable[[], tuple[str | None, str | None]],
         timezone: str = "UTC",
         api_host: str | None = None,
         interval: float = PROBE_INTERVAL_SECONDS,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.time,
     ):
-        self._token = token
-        self._user_id = user_id
+        self._credentials = credentials
         self._tz = ZoneInfo(timezone)
         self._host = api_host or DEFAULT_API_HOST
         self._interval = interval
         self._transport = transport
         self._clock = clock
-        self._lock = asyncio.Lock()
         self._last: ProbeResult | None = None
+        self._task: asyncio.Task[ProbeResult] | None = None
 
-    async def result(self) -> ProbeResult:
-        async with self._lock:
-            now = self._clock()
-            if self._last is None or now - self._last.checked_at >= self._interval:
-                self._last = await self._probe(now)
-            return self._last
+    def snapshot(self) -> ProbeResult | None:
+        """The latest answer, starting a background refresh when one is due."""
+        now = self._clock()
+        due = self._last is None or now - self._last.checked_at >= self._interval
+        if due and (self._task is None or self._task.done()):
+            self._task = asyncio.get_running_loop().create_task(self.refresh())
+        return self._last
+
+    async def refresh(self) -> ProbeResult:
+        now = self._clock()
+        try:
+            result = await self._probe(now)
+        except Exception as exc:  # a probe bug must never take /metrics down
+            logger.warning("Upstream probe raised %s", type(exc).__name__)
+            result = ProbeResult(now, False, None, None)
+        self._last = result
+        return result
 
     async def _probe(self, now: float) -> ProbeResult:
-        if not self._token or not self._user_id:
+        token, user_id = self._credentials()
+        if not token or not user_id:
             return ProbeResult(now, False, None, None)
         today = datetime.fromtimestamp(now, self._tz).date()
         params = {
             "query_type": "summary",
             "device_type": "android_phone",
-            "userid": self._user_id,
+            "userid": user_id,
             "from_date": (today - timedelta(days=PROBE_WINDOW_DAYS)).isoformat(),
             "to_date": today.isoformat(),
         }
         headers = {
-            "apptoken": self._token,
+            "apptoken": token,
             "appPlatform": "web",
             "appname": "com.xiaomi.hm.health",
         }
@@ -227,24 +250,28 @@ def _fmt(value: float) -> str:
 
 
 class _Exposition:
+    """Collects samples per metric family and writes each family as one block,
+    as the text format requires (a strict parser drops the type otherwise)."""
+
     def __init__(self) -> None:
-        self._lines: list[str] = []
-        self._described: set[str] = set()
+        self._families: dict[str, tuple[str, list[str]]] = {}
 
     def add(
         self, name: str, help_text: str, value: float, labels: dict[str, str] | None = None
     ) -> None:
-        if name not in self._described:
-            self._lines.append(f"# HELP {name} {help_text}")
-            self._lines.append(f"# TYPE {name} gauge")
-            self._described.add(name)
         label_text = ""
         if labels:
             label_text = "{" + ",".join(f'{k}="{v}"' for k, v in sorted(labels.items())) + "}"
-        self._lines.append(f"{name}{label_text} {_fmt(value)}")
+        family = self._families.setdefault(name, (help_text, []))
+        family[1].append(f"{name}{label_text} {_fmt(value)}")
 
     def text(self) -> str:
-        return "\n".join(self._lines) + "\n"
+        lines: list[str] = []
+        for name, (help_text, samples) in self._families.items():
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} gauge")
+            lines.extend(samples)
+        return "\n".join(lines) + "\n"
 
 
 def render_metrics(

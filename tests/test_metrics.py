@@ -73,9 +73,15 @@ def test_newest_filed_day_ignores_days_without_a_summary():
     assert newest_filed_day(rows) == date(2026, 11, 10)
 
 
-def test_newest_filed_day_survives_junk_rows():
-    rows = [None, "x", {"date_time": "not-a-date", "summary": _summary()}, {"summary": _summary()}]
-    assert newest_filed_day(rows) is None
+def test_newest_filed_day_finds_the_real_day_among_junk_rows():
+    rows = [
+        None,
+        "x",
+        {"date_time": "not-a-date", "summary": _summary()},
+        {"summary": _summary()},
+        {"date_time": "2026-11-07", "summary": _summary()},
+    ]
+    assert newest_filed_day(rows) == date(2026, 11, 7)
 
 
 # -- UpstreamProbe ------------------------------------------------------------
@@ -89,10 +95,16 @@ class _Clock:
         return self.now
 
 
-NOW = datetime(2026, 11, 11, 17, 30, tzinfo=UTC).timestamp()
+# 20:00 UTC on the 11th is 01:30 IST on the 12th: the user's "today" and UTC's
+# differ, so a probe that ignored the timezone would ask for the wrong window.
+NOW = datetime(2026, 11, 11, 20, 0, tzinfo=UTC).timestamp()
 
 
-async def test_probe_asks_for_a_small_window_in_the_users_timezone_and_reports_the_newest_day():
+def _creds(token="tok", user="u1"):
+    return lambda: (token, user)
+
+
+async def test_probe_asks_for_a_month_in_the_users_timezone_and_reports_the_newest_day():
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -100,41 +112,73 @@ async def test_probe_asks_for_a_small_window_in_the_users_timezone_and_reports_t
         return httpx.Response(200, json=_band_response("2026-11-09", "2026-11-10"))
 
     probe = UpstreamProbe(
-        "tok",
-        "u1",
+        _creds(),
         timezone="Asia/Kolkata",
         transport=httpx.MockTransport(handler),
         clock=_Clock(NOW),
     )
-    result = await probe.result()
+    result = await probe.refresh()
 
     assert result == ProbeResult(NOW, True, 200, date(2026, 11, 10))
     params = dict(seen[0].url.params)
-    # 17:30 UTC is 23:00 IST on the 11th: "today" is the user's day, not UTC's.
-    assert params["to_date"] == "2026-11-11"
-    assert params["from_date"] == "2026-11-09"
+    assert params["to_date"] == "2026-11-12"
+    # Wide enough that a phone silent for days still has a newest day to report,
+    # so "the phone isn't uploading" stays true instead of turning into no data.
+    assert params["from_date"] == "2026-10-13"
     assert params["userid"] == "u1"
     assert seen[0].headers["apptoken"] == "tok"
 
 
-async def test_probe_caches_between_intervals():
-    calls = 0
+async def test_a_renewed_token_is_used_without_a_restart():
+    tokens = iter(["old", "new"])
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
+        seen.append(request.headers["apptoken"])
         return httpx.Response(200, json=_band_response("2026-11-10"))
 
-    clock = _Clock(NOW)
     probe = UpstreamProbe(
-        "tok", "u1", interval=600, transport=httpx.MockTransport(handler), clock=clock
+        lambda: (next(tokens), "u1"), transport=httpx.MockTransport(handler), clock=_Clock(NOW)
     )
-    await probe.result()
+    await probe.refresh()
+    await probe.refresh()
+    assert seen == ["old", "new"]
+
+
+async def test_a_scrape_never_waits_on_zepp():
+    import asyncio
+
+    release = asyncio.Event()
+    calls = 0
+
+    class Slow(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return httpx.Response(200, json=_band_response("2026-11-10"))
+
+    clock = _Clock(NOW)
+    probe = UpstreamProbe(_creds(), transport=Slow(), interval=600, clock=clock)
+    # First scrape: nothing known yet, a refresh starts, and the scrape returns.
+    assert probe.snapshot() is None
+    await asyncio.sleep(0)
+    assert calls == 1
+    # Further scrapes while Zepp is slow neither wait nor pile up requests.
+    assert probe.snapshot() is None
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    await probe._task
+    assert probe.snapshot().newest_day == date(2026, 11, 10)
+    # Not due again for ten minutes.
     clock.now += 599
-    await probe.result()
+    probe.snapshot()
+    await asyncio.sleep(0)
     assert calls == 1
     clock.now += 1
-    await probe.result()
+    probe.snapshot()
+    await probe._task
     assert calls == 2
 
 
@@ -149,28 +193,49 @@ async def test_probe_caches_between_intervals():
 )
 async def test_a_rejected_or_odd_answer_is_not_ok(response, status):
     probe = UpstreamProbe(
-        "tok", "u1", transport=httpx.MockTransport(lambda r: response), clock=_Clock(NOW)
+        _creds(), transport=httpx.MockTransport(lambda r: response), clock=_Clock(NOW)
     )
-    result = await probe.result()
+    result = await probe.refresh()
     assert result.ok is False
     assert result.http_status == status
     assert result.newest_day is None
 
 
 async def test_a_network_error_is_not_ok_and_does_not_raise():
+    attempts = 0
+
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
         raise httpx.ConnectError("boom", request=request)
 
-    probe = UpstreamProbe("tok", "u1", transport=httpx.MockTransport(handler), clock=_Clock(NOW))
-    assert await probe.result() == ProbeResult(NOW, False, None, None)
+    probe = UpstreamProbe(_creds(), transport=httpx.MockTransport(handler), clock=_Clock(NOW))
+    assert await probe.refresh() == ProbeResult(NOW, False, None, None)
+    assert attempts == 1
+
+
+async def test_any_other_probe_error_is_contained():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise ValueError("a bug, or a malformed host")
+
+    probe = UpstreamProbe(_creds(), transport=httpx.MockTransport(handler), clock=_Clock(NOW))
+    assert (await probe.refresh()).ok is False
+
+    def broken_credentials():
+        raise UnicodeError("unreadable token file")
+
+    probe = UpstreamProbe(broken_credentials, clock=_Clock(NOW))
+    assert (await probe.refresh()).ok is False
 
 
 async def test_no_token_means_no_request():
     def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
         raise AssertionError("probe sent a request without a token")
 
-    probe = UpstreamProbe(None, "u1", transport=httpx.MockTransport(handler), clock=_Clock(NOW))
-    assert (await probe.result()).ok is False
+    probe = UpstreamProbe(
+        _creds(token=None), transport=httpx.MockTransport(handler), clock=_Clock(NOW)
+    )
+    assert await probe.refresh() == ProbeResult(NOW, False, None, None)
 
 
 async def test_base64_encoded_data_is_understood():
@@ -181,8 +246,8 @@ async def test_base64_encoded_data_is_understood():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"code": 1, "data": encoded})
 
-    probe = UpstreamProbe("tok", "u1", transport=httpx.MockTransport(handler), clock=_Clock(NOW))
-    assert (await probe.result()).newest_day == date(2026, 11, 10)
+    probe = UpstreamProbe(_creds(), transport=httpx.MockTransport(handler), clock=_Clock(NOW))
+    assert (await probe.refresh()).newest_day == date(2026, 11, 10)
 
 
 # -- render_metrics -----------------------------------------------------------
@@ -198,6 +263,11 @@ def test_render_reports_sync_state_archive_and_upstream(tmp_path):
     probe = ProbeResult(NOW, True, 200, date(2026, 11, 10))
     text = render_metrics(db, "cloud_session", "u1", probe)
 
+    import time as _time
+
+    # Real times, not just present: CURRENT_TIMESTAMP is now, give or take.
+    success = _metric(text, "zepp_sync_last_success_timestamp_seconds", data_type="daily_activity")
+    assert success is not None and abs(success - _time.time()) < 120
     assert _metric(text, "zepp_sync_last_attempt_failed", data_type="daily_activity") == 0
     assert _metric(text, "zepp_sync_last_attempt_failed", data_type="sleep") == 1
     # A failed pass records an attempt but never a success.
@@ -218,7 +288,11 @@ def test_render_never_exposes_archive_values(tmp_path):
     db.insert_daily_activity(_activity("2026-11-10"))
     db.update_sync_state("cloud_session", "u1", "daily_activity", success=True)
     text = render_metrics(db, "cloud_session", "u1", ProbeResult(NOW, True, 200, None))
-    # Steps are 1000 and distance 900 in the fixture; neither may appear.
+    # The archive is there to be leaked: its newest day is reported...
+    assert _metric(
+        text, "zepp_archive_newest_day_timestamp_seconds", data_type="daily_activity"
+    ) == day_seconds(date(2026, 11, 10))
+    # ...but steps are 1000 and distance 900 in the fixture, and neither may appear.
     values = {line.rpartition(" ")[2] for line in text.splitlines() if not line.startswith("#")}
     assert "1000" not in values and "900" not in values
     # And no upstream day when Zepp had none to report.
@@ -231,6 +305,19 @@ def test_a_failed_probe_drops_the_upstream_day_but_reports_why(tmp_path):
     assert _metric(text, "zepp_upstream_probe_ok") == 0
     assert _metric(text, "zepp_upstream_probe_http_status") == 401
     assert _metric(text, "zepp_upstream_newest_day_timestamp_seconds") is None
+
+
+def test_each_metric_family_is_one_block(tmp_path):
+    # The text format wants a family's samples together under its HELP/TYPE;
+    # a strict parser drops the type of a family that is split.
+    db = Database(tmp_path / "z.db")
+    for data_type in ("daily_activity", "sleep"):
+        db.update_sync_state("cloud_session", "u1", data_type, success=True)
+    text = render_metrics(db, "cloud_session", "u1", None)
+    names = [line.split("{")[0].split(" ")[0] for line in text.splitlines() if not line.startswith("#")]
+    blocks = [n for i, n in enumerate(names) if i == 0 or names[i - 1] != n]
+    assert len(blocks) == len(set(blocks))
+    assert text.count("# TYPE zepp_sync_last_attempt_failed gauge") == 1
 
 
 def test_the_exposition_is_parseable(tmp_path):
@@ -256,16 +343,20 @@ def test_metrics_needs_no_bearer_but_mcp_still_does(tmp_path, monkeypatch):
     monkeypatch.setenv("ZEPP_DATABASE_PATH", str(tmp_path / "z.db"))
     monkeypatch.setenv("ZEPP_MODE", "cloud_session")
     monkeypatch.setenv("ZEPP_APP_TOKEN", "tok")
-    monkeypatch.setenv("ZEPP_USER_ID", "u1")
+    # No ZEPP_USER_ID: the chart's default. The id must still be found, from
+    # the archive itself, the way the served tools find it.
+    monkeypatch.delenv("ZEPP_USER_ID", raising=False)
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=_band_response("2026-11-10"))
+    seeded = Database(tmp_path / "z.db")
+    seeded.insert_daily_activity(_activity("2026-11-10", user_id="u1"))
+    seeded.update_sync_state("cloud_session", "u1", "daily_activity", success=True)
 
-    monkeypatch.setattr(
-        server,
-        "_upstream_probe",
-        UpstreamProbe("tok", "u1", transport=httpx.MockTransport(handler)),
-    )
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("the route must not wait on Zepp")
+
+    probe = UpstreamProbe(lambda: ("tok", "u1"), transport=httpx.MockTransport(handler))
+    probe._last = ProbeResult(datetime.now(UTC).timestamp(), True, 200, date(2026, 11, 10))
+    monkeypatch.setattr(server, "_upstream_probe", probe)
     monkeypatch.setattr(server, "context", server.RuntimeContext())
 
     app = server.build_http_app("secret-bearer", read_only=True)
@@ -274,6 +365,10 @@ def test_metrics_needs_no_bearer_but_mcp_still_does(tmp_path, monkeypatch):
         assert metrics.status_code == 200
         assert metrics.headers["content-type"].startswith("text/plain")
         assert _metric(metrics.text, "zepp_upstream_probe_ok") == 1
+        assert (
+            _metric(metrics.text, "zepp_sync_last_attempt_failed", data_type="daily_activity") == 0
+        )
 
-        assert client.post("/mcp", json={}).status_code == 401
+        for path in ("/mcp", "/mcp/"):
+            assert client.post(path, json={}).status_code == 401
         assert client.get("/healthz").status_code == 200
